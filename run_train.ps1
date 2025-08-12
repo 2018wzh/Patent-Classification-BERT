@@ -12,6 +12,7 @@ python train.py `
     --device cuda `
     --fp16 `
     --gpus 0 `
+    --logging_steps=10 `
     --gradient_checkpointing
 
 echo "Training finished."

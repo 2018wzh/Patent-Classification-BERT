@@ -6,3 +6,4 @@ dataset/**
 model/*
 .venv
 outputs/*
+logs/*

@@ -1,6 +1,7 @@
 import json
 import argparse
 import torch
+import os
 from datasets import load_dataset
 from transformers import (
     BertConfig,
@@ -9,7 +10,41 @@ from transformers import (
     Trainer,
     TrainingArguments,
     DataCollatorWithPadding,
+    TrainerCallback,
 )
+from torch.utils.tensorboard import SummaryWriter
+import numpy as np
+
+
+class TensorBoardCallback(TrainerCallback):
+    """自定义TensorBoard回调，用于记录更多的训练指标"""
+    
+    def __init__(self, log_dir):
+        self.log_dir = log_dir
+        self.writer = None
+    
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        if self.writer is None:
+            self.writer = SummaryWriter(log_dir=self.log_dir)
+            print(f"TensorBoard 日志目录: {self.log_dir}")
+            print(f"启动TensorBoard命令: tensorboard --logdir={self.log_dir}")
+    
+    def on_log(self, args, state, control, model=None, logs=None, **kwargs):
+        if self.writer and logs:
+            for key, value in logs.items():
+                if isinstance(value, (int, float)):
+                    self.writer.add_scalar(key, value, state.global_step)
+    
+    def on_evaluate(self, args, state, control, model=None, metrics=None, **kwargs):
+        if self.writer and metrics:
+            for key, value in metrics.items():
+                if isinstance(value, (int, float)) and key.startswith('eval_'):
+                    self.writer.add_scalar(f"evaluation/{key}", value, state.global_step)
+    
+    def on_train_end(self, args, state, control, **kwargs):
+        if self.writer:
+            self.writer.close()
+            print("TensorBoard 记录已保存")
 
 
 def main():
@@ -42,6 +77,10 @@ def main():
     parser.add_argument("--gradient_checkpointing", action="store_true", help="启用梯度检查点")
     parser.add_argument("--no_gradient_checkpointing", action="store_true", help="禁用梯度检查点")
     parser.add_argument("--dataloader_pin_memory", action="store_true", help="启用数据加载器内存固定")
+    
+    # TensorBoard参数
+    parser.add_argument("--tensorboard_log_dir", default=None, help="TensorBoard日志目录")
+    parser.add_argument("--no_tensorboard", action="store_true", help="禁用TensorBoard记录")
     
     args = parser.parse_args()
 
@@ -98,6 +137,20 @@ def main():
     print(f"梯度检查点: {use_gradient_checkpointing}")
     print(f"内存固定: {use_pin_memory}")
 
+    # TensorBoard设置
+    use_tensorboard = not args.no_tensorboard
+    if use_tensorboard:
+        if args.tensorboard_log_dir:
+            tensorboard_log_dir = args.tensorboard_log_dir
+        else:
+            tensorboard_log_dir = os.path.join(args.output_dir, "tensorboard_logs")
+        os.makedirs(tensorboard_log_dir, exist_ok=True)
+        print(f"TensorBoard日志目录: {tensorboard_log_dir}")
+        print(f"启动TensorBoard命令: tensorboard --logdir={tensorboard_log_dir}")
+    else:
+        tensorboard_log_dir = None
+        print("TensorBoard记录已禁用")
+
     # 单独创建 TrainingArguments，针对BERT优化
     training_args = TrainingArguments(
         output_dir=args.output_dir,
@@ -117,7 +170,11 @@ def main():
         fp16=use_fp16,
         dataloader_pin_memory=use_pin_memory,
         gradient_checkpointing=use_gradient_checkpointing,
-        report_to=None,  # 不使用wandb等
+        report_to="tensorboard" if use_tensorboard else None,
+        logging_dir=tensorboard_log_dir if use_tensorboard else None,
+        logging_first_step=True,
+        metric_for_best_model="eval_accuracy",
+        greater_is_better=True,
     )
 
     # 1. 创建二分类标签映射（valid字段是布尔值）
@@ -186,12 +243,46 @@ def main():
     # 4. 设置训练器，使用BERT特定的数据整理器
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer, padding=True)
 
+    # 定义评估指标
+    def compute_metrics(eval_pred):
+        predictions, labels = eval_pred
+        predictions = np.argmax(predictions, axis=1)
+        
+        # 计算准确率
+        accuracy = np.mean(predictions == labels)
+        
+        # 计算精确率、召回率和F1分数
+        from sklearn.metrics import precision_recall_fscore_support, confusion_matrix
+        precision, recall, f1, _ = precision_recall_fscore_support(labels, predictions, average='binary')
+        
+        # 计算混淆矩阵
+        tn, fp, fn, tp = confusion_matrix(labels, predictions).ravel()
+        
+        return {
+            'accuracy': accuracy,
+            'precision': precision,
+            'recall': recall,
+            'f1': f1,
+            'true_positives': tp,
+            'true_negatives': tn,
+            'false_positives': fp,
+            'false_negatives': fn,
+        }
+
+    # 准备回调函数
+    callbacks = []
+    if use_tensorboard:
+        tb_callback = TensorBoardCallback(tensorboard_log_dir)
+        callbacks.append(tb_callback)
+
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=data_collator,
+        compute_metrics=compute_metrics,
+        callbacks=callbacks,
     )
 
     # 5. 训练
@@ -208,6 +299,13 @@ def main():
     trainer.save_metrics("eval", metrics)
 
     print("训练和评估完成!")
+    if use_tensorboard:
+        print(f"\n=== TensorBoard 可视化 ===")
+        print(f"TensorBoard 日志保存在: {tensorboard_log_dir}")
+        print(f"启动 TensorBoard 查看训练过程:")
+        print(f"  tensorboard --logdir={tensorboard_log_dir}")
+        print(f"然后在浏览器中访问: http://localhost:6006")
+        print(f"=========================\n")
 
 
 if __name__ == "__main__":
