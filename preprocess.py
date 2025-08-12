@@ -3,6 +3,7 @@ import json
 import sys
 import os
 from typing import Dict, Any, List, Set
+from tqdm import tqdm
 
 DEFAULT_CONFIG_PATH = os.path.join('config', 'config.json')
 
@@ -97,9 +98,16 @@ def unify_record(row: Dict[str, str], field_mapping: Dict[str, str], label_field
 
 def process_csv_file(path: str, field_mapping: Dict[str, str], label_field_cn: str) -> List[Dict[str, Any]]:
     data: List[Dict[str, Any]] = []
+    
+    # 首先计算总行数（用于进度条）
+    print(f'正在计算文件行数: {os.path.basename(path)}')
+    with open(path, 'r', encoding='utf-8') as f:
+        total_lines = sum(1 for _ in f) - 1  # 减去标题行
+    
     with open(path, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
-        for row in reader:
+        # 使用 tqdm 包装迭代器
+        for row in tqdm(reader, total=total_lines, desc=f'处理 {os.path.basename(path)}', unit='行'):
             data.append(unify_record(row, field_mapping, label_field_cn))
     return data
 
@@ -127,14 +135,15 @@ def main():
     label_field_cn = cfg.get('labelField', 'IPC主分类号')
 
     all_records: List[Dict[str, Any]] = []
-    for rel in convert_files:
+    print(f'共需处理 {len(convert_files)} 个文件')
+    
+    for rel in tqdm(convert_files, desc='处理文件', unit='文件'):
         csv_path = rel if os.path.isabs(rel) else os.path.join(os.path.dirname(config_path), '..', rel).replace('..'+os.sep+os.sep, '..'+os.sep)
         if not os.path.exists(csv_path):
             csv_path = rel if os.path.isabs(rel) else os.path.join(os.getcwd(), rel)
         if not os.path.exists(csv_path):
             print(f'警告: 找不到文件 {rel}, 已跳过')
             continue
-        print(f'处理: {csv_path}')
         records = process_csv_file(csv_path, field_mapping, label_field_cn)
         all_records.extend(records)
 
@@ -150,11 +159,12 @@ def main():
                     return True
         return False
 
-    for r in all_records:
+    for r in tqdm(all_records, desc='验证标签', unit='记录'):
         val = fuzzy_valid(r.get('labels', []))
         r['valid'] = val
     
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    print('正在写入输出文件...')
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(all_records, f, ensure_ascii=False, indent=2)
 
