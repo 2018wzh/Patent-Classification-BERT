@@ -36,6 +36,7 @@ def main():
     
     # 设备和性能参数
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"], help="训练设备")
+    parser.add_argument("--gpus", default="0", help="使用的GPU ID（逗号分隔）")
     parser.add_argument("--fp16", action="store_true", help="使用混合精度训练")
     parser.add_argument("--no_fp16", action="store_true", help="禁用混合精度训练")
     parser.add_argument("--gradient_checkpointing", action="store_true", help="启用梯度检查点")
