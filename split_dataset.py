@@ -53,7 +53,7 @@ def main():
     parser = argparse.ArgumentParser(description='Split dataset into train/val/test')
     parser.add_argument('--input', default=DEFAULT_INPUT, help='输入 data.json 路径')
     parser.add_argument('--outdir', default=DEFAULT_OUT_DIR, help='输出目录')
-    parser.add_argument('--label-key', default='label', help='主标签键名')
+    parser.add_argument('--label-key', default='valid', help='主标签键名')
     parser.add_argument('--ratios', default='0.8,0.1,0.1', help='train,val,test 比例')
     parser.add_argument('--seed', type=int, default=42, help='随机种子')
     args = parser.parse_args()
@@ -76,13 +76,6 @@ def main():
     write_jsonl(os.path.join(args.outdir, 'test.jsonl'), test)
 
     # 保存统计信息
-    # 生成 label2id (按频次降序)
-    label_freq_total = collections.Counter(r.get(args.label_key, 'UNKNOWN') for r in data)
-    sorted_labels = [lbl for lbl, _ in label_freq_total.most_common()]
-    label2id = {lbl: idx for idx, lbl in enumerate(sorted_labels)}
-    with open(os.path.join(args.outdir, 'label2id.json'), 'w', encoding='utf-8') as f:
-        json.dump(label2id, f, ensure_ascii=False, indent=2)
-
     stats = [
         compute_stats('train', train, args.label_key),
         compute_stats('val', val, args.label_key),

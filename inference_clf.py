@@ -23,7 +23,7 @@ def predict(texts: List[str], model_path: str, batch_size: int = 8):
     model.to(device)
     model.eval()
 
-    id2label = model.config.id2label
+    id2label = model.config.id2label if model.config.id2label else {0: "false", 1: "true"}
 
     results = []
     # 2. Process in batches

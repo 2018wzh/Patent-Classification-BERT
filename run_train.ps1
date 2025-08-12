@@ -3,6 +3,6 @@ python train.py `
     --model ./model `
     --train_file ./dataset/train.jsonl `
     --validation_file ./dataset/val.jsonl `
-    --label2id_file ./dataset/label2id.json
+    --output_dir ./outputs/bert-classification
 
 echo "Training finished."
