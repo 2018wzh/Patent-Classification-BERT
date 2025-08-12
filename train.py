@@ -13,15 +13,6 @@ from transformers import (
 
 
 def main():
-    # 检查GPU可用性
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"使用设备: {device}")
-    if torch.cuda.is_available():
-        print(f"GPU型号: {torch.cuda.get_device_name(0)}")
-        print(f"GPU显存: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
-    else:
-        print("警告: 未检测到GPU，将使用CPU训练（速度会很慢）")
-    
     parser = argparse.ArgumentParser(description="BERT模型微调训练脚本")
     parser.add_argument("--model", required=True, help="预训练模型路径或模型名称")
     parser.add_argument("--train_file", required=True, help="训练数据文件 (jsonl格式)")
@@ -32,37 +23,99 @@ def main():
     parser.add_argument("--label_column_name", default="valid", help="标签列名")
     parser.add_argument("--max_seq_length", type=int, default=512, help="最大序列长度")
     parser.add_argument("--output_dir", required=True, help="输出目录")
+    
+    # 训练参数
+    parser.add_argument("--per_device_train_batch_size", type=int, default=None, help="训练批次大小")
+    parser.add_argument("--per_device_eval_batch_size", type=int, default=None, help="评估批次大小")
+    parser.add_argument("--num_train_epochs", type=int, default=3, help="训练轮数")
+    parser.add_argument("--learning_rate", type=float, default=2e-5, help="学习率")
+    parser.add_argument("--warmup_ratio", type=float, default=0.1, help="预热比例")
+    parser.add_argument("--weight_decay", type=float, default=0.01, help="权重衰减")
+    parser.add_argument("--logging_steps", type=int, default=50, help="日志记录步数")
+    parser.add_argument("--save_total_limit", type=int, default=2, help="保存模型数量限制")
+    
+    # 设备和性能参数
+    parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"], help="训练设备")
+    parser.add_argument("--fp16", action="store_true", help="使用混合精度训练")
+    parser.add_argument("--no_fp16", action="store_true", help="禁用混合精度训练")
+    parser.add_argument("--gradient_checkpointing", action="store_true", help="启用梯度检查点")
+    parser.add_argument("--no_gradient_checkpointing", action="store_true", help="禁用梯度检查点")
+    parser.add_argument("--dataloader_pin_memory", action="store_true", help="启用数据加载器内存固定")
+    
     args = parser.parse_args()
 
-    # 单独创建 TrainingArguments，针对BERT优化
-    # 根据GPU可用性调整参数
-    if torch.cuda.is_available():
-        batch_size = 16
-        use_fp16 = True
-        gradient_checkpointing = True
+    # 设备选择逻辑
+    if args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    elif args.device == "cuda":
+        if not torch.cuda.is_available():
+            print("警告: 指定使用CUDA但未检测到GPU，将使用CPU")
+            device = torch.device("cpu")
+        else:
+            device = torch.device("cuda")
     else:
-        batch_size = 4  # CPU时使用较小的batch size
-        use_fp16 = False  # CPU不支持fp16
-        gradient_checkpointing = False
+        device = torch.device("cpu")
     
+    print(f"使用设备: {device}")
+    if device.type == "cuda":
+        print(f"GPU型号: {torch.cuda.get_device_name(0)}")
+        print(f"GPU显存: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+
+    # 批次大小设置
+    if args.per_device_train_batch_size is None:
+        train_batch_size = 16 if device.type == "cuda" else 4
+    else:
+        train_batch_size = args.per_device_train_batch_size
+    
+    if args.per_device_eval_batch_size is None:
+        eval_batch_size = train_batch_size
+    else:
+        eval_batch_size = args.per_device_eval_batch_size
+
+    # FP16设置
+    if args.no_fp16:
+        use_fp16 = False
+    elif args.fp16:
+        use_fp16 = True
+    else:
+        use_fp16 = device.type == "cuda"  # 默认GPU使用FP16，CPU不使用
+
+    # 梯度检查点设置
+    if args.no_gradient_checkpointing:
+        use_gradient_checkpointing = False
+    elif args.gradient_checkpointing:
+        use_gradient_checkpointing = True
+    else:
+        use_gradient_checkpointing = device.type == "cuda"  # 默认GPU使用梯度检查点
+
+    # 数据加载器内存固定
+    use_pin_memory = args.dataloader_pin_memory or (device.type == "cuda")
+
+    print(f"训练批次大小: {train_batch_size}")
+    print(f"评估批次大小: {eval_batch_size}")
+    print(f"使用FP16: {use_fp16}")
+    print(f"梯度检查点: {use_gradient_checkpointing}")
+    print(f"内存固定: {use_pin_memory}")
+
+    # 单独创建 TrainingArguments，针对BERT优化
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         do_train=True,
         do_eval=True,
-        num_train_epochs=3,
-        per_device_train_batch_size=batch_size,
-        per_device_eval_batch_size=batch_size,
-        learning_rate=2e-5,  # BERT推荐的学习率
-        warmup_ratio=0.1,  # 10%的warmup步骤
-        weight_decay=0.01,  # 权重衰减
-        logging_steps=50,
+        num_train_epochs=args.num_train_epochs,
+        per_device_train_batch_size=train_batch_size,
+        per_device_eval_batch_size=eval_batch_size,
+        learning_rate=args.learning_rate,
+        warmup_ratio=args.warmup_ratio,
+        weight_decay=args.weight_decay,
+        logging_steps=args.logging_steps,
         eval_strategy="epoch",
         save_strategy="epoch",
         load_best_model_at_end=True,
-        save_total_limit=2,
+        save_total_limit=args.save_total_limit,
         fp16=use_fp16,
-        dataloader_pin_memory=torch.cuda.is_available(),
-        gradient_checkpointing=gradient_checkpointing,
+        dataloader_pin_memory=use_pin_memory,
+        gradient_checkpointing=use_gradient_checkpointing,
         report_to=None,  # 不使用wandb等
     )
 
