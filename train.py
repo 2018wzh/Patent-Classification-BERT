@@ -114,20 +114,35 @@ class JsonlClassificationDataset(torch.utils.data.Dataset):
 
 
 class PreTokenizedCollator:
-    def __init__(self, pad_token_id: int = 0):
+    def __init__(self, pad_token_id: int = 0, max_seq_length: int | None = None, truncate: bool = True):
+        """动态 padding 的同时可选截断。
+
+        max_seq_length: 若提供则批内最长不超过该值，超过将截断 (truncate=True) 或报错 (truncate=False)
+        """
         self.pad_token_id = pad_token_id
+        self.max_seq_length = max_seq_length
+        self.truncate = truncate
 
     def __call__(self, features: List[Dict[str, torch.Tensor]]):
-        max_len = max(f["input_ids"].size(0) for f in features)
+        # 计算批内原始最大长度
+        raw_max = max(f["input_ids"].size(0) for f in features)
+        if self.max_seq_length is not None and raw_max > self.max_seq_length:
+            if not self.truncate:
+                raise ValueError(f"批次中出现长度 {raw_max} > 允许最大 {self.max_seq_length}")
+            target_max = self.max_seq_length
+        else:
+            target_max = raw_max
         ids_batch, mask_batch, label_batch = [], [], []
         for f in features:
             ids = f["input_ids"]
             mask = f["attention_mask"]
-            pad_len = max_len - ids.size(0)
+            if ids.size(0) > target_max:
+                # 截断
+                ids = ids[:target_max]
+                mask = mask[:target_max]
+            pad_len = target_max - ids.size(0)
             if pad_len > 0:
-                ids = torch.nn.functional.pad(
-                    ids, (0, pad_len), value=self.pad_token_id
-                )
+                ids = torch.nn.functional.pad(ids, (0, pad_len), value=self.pad_token_id)
                 mask = torch.nn.functional.pad(mask, (0, pad_len), value=0)
             ids_batch.append(ids)
             mask_batch.append(mask)
@@ -190,6 +205,7 @@ def main():
         raise ValueError("配置文件缺少 'trainConfig' 节点，请检查 config.json 结构。")
 
     train_cfg_dict = full_config["trainConfig"]
+    pack_cfg = full_config.get('packConfig') or {}
 
     # 为了方便访问，将字典转换为对象（不考虑旧格式兼容）
     class ConfigObject:
@@ -303,14 +319,91 @@ def main():
     print(f"标签数量: {num_labels}")
     print(f"标签映射: {label2id}")
 
-    # 3. 自定义数据集加载 (可设置策略 environment variable: DATASET_STRATEGY=memory|stream)
-    train_dataset = JsonlClassificationDataset(args.train_file, strategy=strategy)
-    eval_dataset = JsonlClassificationDataset(args.validation_file, strategy=strategy)
-    print(f"训练集大小: {len(train_dataset)} (strategy={strategy})")
-    print(f"验证集大小: {len(eval_dataset)} (strategy={strategy})")
+    # 模型最大位置长度
+    model_max_pos = getattr(config, 'max_position_embeddings', None)
+    if model_max_pos is None:
+        model_max_pos = 512  # 兜底
+    desired_train_max = getattr(args, 'max_seq_length', model_max_pos)
+    pack_desired = pack_cfg.get('max_seq_length') if pack_cfg else None
+    effective_seq_len = min([v for v in [model_max_pos, desired_train_max, pack_desired] if isinstance(v, int)]) if any(isinstance(v,int) for v in [model_max_pos, desired_train_max, pack_desired]) else model_max_pos
+    print(f"模型 max_position_embeddings={model_max_pos} 期望 max_seq_length={desired_train_max} pack_max={pack_desired} -> 有效训练长度={effective_seq_len}")
 
-    # 4. 数据已分词，使用自定义动态 padding 整理器
-    data_collator = PreTokenizedCollator(pad_token_id=tokenizer.pad_token_id or 0)
+    # 3. 数据集加载: 优先使用预打包 pt -> 其次 jsonl
+    class PackedTensorDataset(torch.utils.data.Dataset):
+        def __init__(self, pt_path: str):
+            obj = torch.load(pt_path, map_location='cpu')
+            self.input_ids = obj['input_ids']
+            self.attention_mask = obj['attention_mask']
+            self.labels = obj['labels']
+            self.meta = obj.get('meta', {})
+        def __len__(self):
+            return self.input_ids.size(0)
+        def __getitem__(self, idx):
+            return {
+                'input_ids': self.input_ids[idx],
+                'attention_mask': self.attention_mask[idx],
+                'labels': self.labels[idx],
+            }
+
+    def pick_dataset(path: str, split: str):
+        if path.endswith('.pt') and os.path.exists(path):
+            ds = PackedTensorDataset(path)
+            print(f"[{split}] 直接加载打包数据: {path} shape={tuple(ds.input_ids.shape)}")
+            return ds, True
+        if path.endswith('.jsonl'):
+            packed_alt = path[:-6] + '_packed.pt'
+            if os.path.exists(packed_alt):
+                ds = PackedTensorDataset(packed_alt)
+                print(f"[{split}] 自动发现打包文件 {packed_alt} shape={tuple(ds.input_ids.shape)}")
+                return ds, True
+        # fallback jsonl
+        ds = JsonlClassificationDataset(path, strategy=strategy)
+        print(f"[{split}] 使用 jsonl ({path}) size={len(ds)} strategy={strategy}")
+        return ds, False
+
+    # 若 packConfig.enable 且未找到现成打包文件，可提示用户先执行 pack_dataset
+    train_dataset, train_packed = pick_dataset(args.train_file, 'train')
+    eval_dataset, eval_packed = pick_dataset(args.validation_file, 'val')
+    if pack_cfg.get('enable') and (not train_packed or not eval_packed):
+        print('[提示] packConfig.enable=true 但未检测到全部打包文件。可运行:')
+        print('  python pack_dataset.py --inputs {0} {1} --out_dir {2} --max_seq_length {3}'.format(
+            args.train_file,
+            args.validation_file,
+            os.path.dirname(args.train_file) or 'dataset',
+            pack_cfg.get('max_seq_length', args.max_seq_length if hasattr(args,'max_seq_length') else 512)
+        ))
+    print(f"训练集大小: {len(train_dataset)}  验证集大小: {len(eval_dataset)}")
+
+    # 4. 数据整理器: 若使用打包数据(已定长)则不需要动态padding
+    def _maybe_resize_position_embeddings(model, new_len: int):
+        old_len = model.config.max_position_embeddings
+        if new_len <= old_len:
+            return
+        print(f"[警告] 扩展位置嵌入 {old_len} -> {new_len}. 这可能影响模型性能 (未预训练的区域)。")
+        # 仅针对 BERT 结构
+        emb = model.bert.embeddings.position_embeddings
+        old_weight = emb.weight.data
+        hidden_size = old_weight.size(1)
+        new_emb = torch.nn.Embedding(new_len, hidden_size)
+        # 拷贝已有
+        new_emb.weight.data[:old_len] = old_weight
+        # 用最后一个位置向量填充新增位置
+        for pos in range(old_len, new_len):
+            new_emb.weight.data[pos] = old_weight[-1]
+        model.bert.embeddings.position_embeddings = new_emb
+        model.config.max_position_embeddings = new_len
+
+    if train_packed and eval_packed:
+        packed_seq_len = train_dataset.input_ids.size(1)
+        if packed_seq_len > model_max_pos:
+            _maybe_resize_position_embeddings(model, packed_seq_len)
+            effective_seq_len = packed_seq_len
+        data_collator = None
+        print(f"使用打包张量数据集: 序列定长 {packed_seq_len} (有效长度={effective_seq_len}) 跳过动态 padding")
+    else:
+        if effective_seq_len < model_max_pos:
+            print(f"[信息] 将训练序列截断到 {effective_seq_len} <= 模型最大 {model_max_pos}")
+        data_collator = PreTokenizedCollator(pad_token_id=tokenizer.pad_token_id or 0, max_seq_length=effective_seq_len, truncate=True)
 
     # 定义评估指标
     def compute_metrics(eval_pred):

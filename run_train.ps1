@@ -6,6 +6,10 @@ echo "Splitting dataset..."
 python split_dataset.py
 echo "Dataset split finished."
 
+echo "Packaging dataset..."
+python pack_dataset.py
+echo "Packaging finished."
+
 echo "Starting training..."
 python train.py
 echo "Training finished."

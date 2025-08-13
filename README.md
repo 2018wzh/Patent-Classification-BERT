@@ -133,6 +133,29 @@ python train.py --model ./model --train_file ./dataset/train.jsonl --validation_
 - `--output_dir`: 模型输出目录
 - `--max_seq_length`: 最大序列长度（默认512）
 
+#### 数据加载与打包加速
+支持两种数据形态:
+1. 原始 tokenized jsonl (动态 padding)
+2. 预打包定长张量 *_packed.pt (跳过解析与 padding, 启动更快)
+
+在 `config/config.json` 中通过 `packConfig` 控制:
+```jsonc
+"packConfig": {
+   "enable": true,
+   "max_seq_length": 512,      // 省略或 null 时自动选取当前 jsonl 最长序列
+   "pad_token_id": 0,
+   "suffix": "_packed.pt",
+   "overwrite": false          // 已存在是否重新生成
+}
+```
+启用后训练启动若发现缺少对应打包文件或需要覆盖，会自动生成 `train_packed.pt` / `val_packed.pt`。
+
+手动批量打包示例:
+```bash
+python pack_dataset.py --inputs dataset/train.jsonl dataset/val.jsonl --out_dir dataset --max_seq_length 512
+```
+随后再次训练将直接加载打包文件（省略动态 padding）。如需关闭自动打包，将 `enable` 设为 false。
+
 #### 训练配置
 模型会自动检测GPU可用性并调整参数：
 - **GPU可用时**: batch_size=16, fp16=True
