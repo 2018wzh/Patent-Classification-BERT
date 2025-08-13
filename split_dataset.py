@@ -1,4 +1,4 @@
-import json, os, sys, math, random, argparse, collections
+import json, os, sys, math, random, collections
 from typing import List, Dict, Any, Tuple
 from tqdm import tqdm
 
@@ -116,89 +116,69 @@ def compute_stats(name: str, data: List[Dict[str, Any]], label_key: str) -> Dict
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Split dataset into train/val/test (支持统一 config.json 的 splitConfig)')
-    parser.add_argument('--config_file', default=DEFAULT_CONFIG_FILE, help='配置文件 (包含 splitConfig) 路径')
-    parser.add_argument('--input', default=None, help='输入 data.json 路径 (若提供则覆盖配置)')
-    parser.add_argument('--outdir', default=None, help='输出目录 (若提供则覆盖配置)')
-    parser.add_argument('--label-key', default=None, help='主标签键名 (若提供则覆盖配置)')
-    parser.add_argument('--ratios', default=None, help='train,val,test 比例 (若提供则覆盖配置)')
-    parser.add_argument('--seed', type=int, default=None, help='随机种子 (若提供则覆盖配置)')
-    args = parser.parse_args()
-
-    # 读取配置文件
-    if not os.path.exists(args.config_file):
-        print(f'错误: 配置文件不存在 {args.config_file}')
+    config_file = DEFAULT_CONFIG_FILE
+    if not os.path.exists(config_file):
+        print(f'错误: 配置文件不存在 {config_file}')
         sys.exit(1)
-    with open(args.config_file, 'r', encoding='utf-8') as f:
+    with open(config_file, 'r', encoding='utf-8') as f:
         full_cfg = json.load(f)
     split_cfg = full_cfg.get('splitConfig') or {}
 
-    # 从 splitConfig 读取，CLI 非空则覆盖
-    input_path = args.input or split_cfg.get('input', DEFAULT_INPUT)
-    outdir = args.outdir or split_cfg.get('outdir', DEFAULT_OUT_DIR)
-    label_key = args.label_key or split_cfg.get('label_key', 'label')
-    ratios_raw = args.ratios or split_cfg.get('ratios', '0.8,0.1,0.1')
-    seed = args.seed if args.seed is not None else split_cfg.get('seed', 42)
+    input_path = split_cfg.get('input', DEFAULT_INPUT)
+    outdir = split_cfg.get('outdir', DEFAULT_OUT_DIR)
+    label_key = split_cfg.get('label_key', 'label')
+    ratios_raw = split_cfg.get('ratios', '0.8,0.1,0.1')
+    seed = split_cfg.get('seed', 42)
 
     print('=== 数据集划分工具 ===')
-    print(f'配置文件: {args.config_file}')
+    print(f'配置文件: {config_file}')
     print(f'输入文件: {input_path}')
     print(f'输出目录: {outdir}')
     print(f'标签键: {label_key}')
     print(f'划分比例: {ratios_raw}')
     print(f'随机种子: {seed}')
 
-    # 解析划分比例
     ratios_tuple = tuple(float(x) for x in (ratios_raw if isinstance(ratios_raw, str) else ','.join(map(str, ratios_raw))).split(','))
     if len(ratios_tuple) != 3 or not math.isclose(sum(ratios_tuple), 1.0, rel_tol=1e-3):
         print('错误: 比例必须是3个数字且和为1.0')
         sys.exit(1)
 
-    # 第一步：读取数据到内存
     print(f'\n--- 第1步: 读取数据 ---')
     data = load_data(input_path)
     if not data:
         print('数据为空，退出')
         sys.exit(0)
 
-    # 第二步：在内存中进行数据划分
     print(f'\n--- 第2步: 划分数据 ---')
-    train, val, test = global_random_split(data, ratios_tuple, args.seed)
+    train, val, test = global_random_split(data, ratios_tuple, seed)
 
-    # 第三步：创建输出目录并写入文件
     print(f'\n--- 第3步: 写入文件 ---')
     os.makedirs(outdir, exist_ok=True)
-    
-    # 并行写入三个文件
     files_to_write = [
-    (os.path.join(outdir, 'train.jsonl'), train),
-    (os.path.join(outdir, 'val.jsonl'), val),
-    (os.path.join(outdir, 'test.jsonl'), test)
+        (os.path.join(outdir, 'train.jsonl'), train),
+        (os.path.join(outdir, 'val.jsonl'), val),
+        (os.path.join(outdir, 'test.jsonl'), test)
     ]
-    
     for filepath, dataset in files_to_write:
         write_jsonl(filepath, dataset)
 
-    # 第四步：计算并保存统计信息
     print(f'\n--- 第4步: 计算统计信息 ---')
     stats = [
-        compute_stats('train', train, args.label_key),
-        compute_stats('val', val, args.label_key),
-        compute_stats('test', test, args.label_key),
+        compute_stats('train', train, label_key),
+        compute_stats('val', val, label_key),
+        compute_stats('test', test, label_key),
         {
             'total': len(data),
             'mode': 'global_random',
-            'seed': args.seed,
+            'seed': seed,
             'ratios': list(ratios_tuple)
         }
     ]
-    
     stats_file = os.path.join(outdir, 'split_stats.json')
     print(f'正在保存统计信息到: {stats_file}')
     with open(stats_file, 'w', encoding='utf-8') as f:
         json.dump(stats, f, ensure_ascii=False, indent=2)
 
-    # 第五步：显示完成信息
     print(f'\n=== 划分完成 ===')
     print(f'训练集: {len(train)} 条')
     print(f'验证集: {len(val)} 条')

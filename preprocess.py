@@ -15,50 +15,36 @@ def load_config(path: str) -> Dict[str, Any]:
 
 
 def tokenize_and_format(records: List[Dict[str, Any]], train_config: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    使用BERT分词器对记录进行分词和格式化。
-    """
+    """单线程分词（包含有效+无效全部数据）。"""
     model_name = train_config.get("model")
     if not model_name:
         print("错误: 训练配置中缺少 'model' 名称。")
         sys.exit(1)
 
-    print(f"\n--- 开始分词和格式化 ---")
-    print(f"加载分词器: {model_name}")
-    tokenizer = BertTokenizer.from_pretrained(model_name, do_lower_case=True)
-    
     max_seq_length = train_config.get("max_seq_length", 512)
     text_column = train_config.get("text_column_name", "text")
     label_column = train_config.get("label_column_name", "valid")
 
-    print(f"最大序列长度: {max_seq_length}")
-
-    tokenized_records = []
-    for record in tqdm(records, desc="正在分词", unit="条"):
-        # BERT分词，添加特殊tokens
-        # 注意：这里不进行padding，padding将在训练时由DataCollator完成
-        tokenized_output = tokenizer(
-            record[text_column],
+    print("\n--- 开始分词 (单线程) ---")
+    tokenizer = BertTokenizer.from_pretrained(model_name, do_lower_case=True)
+    out: List[Dict[str, Any]] = []
+    for rec in tqdm(records, desc="分词", unit="条"):
+        enc = tokenizer(
+            rec[text_column],
             padding=False,
             max_length=max_seq_length,
             truncation=True,
             add_special_tokens=True,
             return_attention_mask=True,
         )
-        
-        # 将布尔值转换为整数标签
-        label = 1 if record[label_column] else 0
-        
-        formatted_record = {
-            "input_ids": tokenized_output["input_ids"],
-            "attention_mask": tokenized_output["attention_mask"],
-            "label": label,
-            "original_id": record.get("id", "") # 保留原始ID以便追溯
-        }
-        tokenized_records.append(formatted_record)
-        
-    print("分词和格式化完成。")
-    return tokenized_records
+        out.append({
+            "input_ids": enc["input_ids"],
+            "attention_mask": enc["attention_mask"],
+            "label": 1 if rec.get(label_column) else 0,
+            "original_id": rec.get("id", "")
+        })
+    print(f"分词完成，总样本: {len(out)}")
+    return out
 
 
 
@@ -189,11 +175,8 @@ def process_csv_file(
     # 第二步：在内存中处理所有行
     data: List[Dict[str, Any]] = []
     for row in tqdm(all_rows, desc=f"处理 {os.path.basename(path)}", unit="行"):
-        processed_record = unify_record(row, remove_keywords)
-        data.append(processed_record)
-
+        data.append(unify_record(row, remove_keywords))
     return data
-
 
 def main():
     # 允许: python preprocess.py 或 python preprocess.py <config_path>
@@ -300,8 +283,11 @@ def main():
     train_config = train_cfg
     print(f"已读取 trainConfig 节点，共 {len(train_config)} 个键")
 
-    # 对验证通过的记录进行分词
-    tokenized_data = tokenize_and_format(valid_records, train_config)
+    print("\n--- 构建二分类数据集 (包含全部样本) ---")
+    print(f"正类(有效)= {valid_count}  负类(无效)= {invalid_count}  总计= {total_count}")
+
+    # 对全部样本分词 (label = valid)
+    tokenized_data = tokenize_and_format(all_records, train_config)
 
     # 写入输出文件
     print(f"\n--- 写入输出文件 ---")
@@ -323,7 +309,7 @@ def main():
 
     print(f"\n=== 处理完成 ===")
     print(f"总记录数: {total_count}")
-    print(f"有效记录 (已分词): {len(tokenized_data)}")
+    print(f"已分词样本数: {len(tokenized_data)} (包含有效+无效)")
     print(f"带标签的原始数据输出: {raw_output_file}")
     print(f"分词后数据输出: {tokenized_output_file}")
 
