@@ -2,47 +2,170 @@ import json
 import argparse
 import torch
 import os
-from typing import Any, cast
-from datasets import Dataset as HFDataset
-from datasets import load_dataset
+from typing import Any, List, Dict
 from transformers import (
     BertConfig,
     BertTokenizer,
     BertForSequenceClassification,
     Trainer,
     TrainingArguments,
-    DataCollatorWithPadding,
     TrainerCallback,
 )
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
+from tqdm import tqdm
+
+
+class JsonlClassificationDataset(torch.utils.data.Dataset):
+    """读取预先分词(tokenized)好的 jsonl 文件，支持 memory / stream 策略与自动回退。
+
+    strategy:
+      - memory: 读取全部行到内存后解析 (速度快，需足够内存)
+      - stream: 两遍文件扫描 (第一遍统计非空行数，第二遍解析)；内存占用低
+    自动回退: memory 模式若发生 OSError 或 MemoryError，则回退到 stream。
+    """
+
+    def __init__(self, path: str, show_progress: bool = True, strategy: str = "memory"):
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"找不到数据文件: {path}")
+        self.path = path
+        self.samples: List[Dict[str, Any]] = []
+        strategy = (strategy or "memory").lower()
+        if strategy not in {"memory", "stream"}:
+            print(f"[Dataset] 未知策略 {strategy} 使用 memory")
+            strategy = "memory"
+        try:
+            if strategy == "memory":
+                self._load_memory(show_progress)
+            else:
+                self._load_stream(show_progress)
+        except (OSError, MemoryError) as e:
+            print(f"[Dataset] memory 策略失败: {e}. 回退 stream 模式。")
+            self.samples.clear()
+            self._load_stream(show_progress)
+
+    # ====== 内部方法 ======
+    def _normalize(self, obj: Dict[str, Any]) -> Dict[str, Any]:
+        label_val = obj.get("label") if "label" in obj else obj.get("labels")
+        if isinstance(label_val, bool):
+            label_val = 1 if label_val else 0
+        return {
+            "input_ids": obj["input_ids"],
+            "attention_mask": obj["attention_mask"],
+            "labels": int(label_val) if label_val is not None else 0,
+        }
+
+    def _load_memory(self, show_progress: bool):
+        size_mb = os.path.getsize(self.path) / 1024 / 1024
+        print(f"[Dataset] memory 模式加载 {self.path} ({size_mb:.2f} MB)")
+        with open(self.path, "r", encoding="utf-8") as f:
+            lines = [ln.rstrip("\n") for ln in f]
+        lines = [ln for ln in lines if ln.strip()]
+        print(f"[Dataset] 非空行: {len(lines)}")
+        it = lines
+        if show_progress:
+            it = tqdm(lines, desc=f"解析 {os.path.basename(self.path)}", unit="行")  # type: ignore
+        bad = 0
+        for line in it:  # type: ignore
+            try:
+                obj = json.loads(line)
+                self.samples.append(self._normalize(obj))
+            except Exception:
+                bad += 1
+        if bad:
+            print(f"[Dataset] 跳过损坏行: {bad}")
+
+    def _load_stream(self, show_progress: bool):
+        size_mb = os.path.getsize(self.path) / 1024 / 1024
+        print(f"[Dataset] stream 模式加载 {self.path} ({size_mb:.2f} MB)")
+        # 第一遍统计
+        with open(self.path, "r", encoding="utf-8") as f:
+            total = sum(1 for ln in f if ln.strip())
+        print(f"[Dataset] 预计解析行数: {total}")
+        # 第二遍解析
+        with open(self.path, "r", encoding="utf-8") as f:
+            iterator = f
+            if show_progress:
+                iterator = tqdm(f, total=total, desc=f"解析 {os.path.basename(self.path)}", unit="行")  # type: ignore
+            bad = 0
+            for line in iterator:  # type: ignore
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    self.samples.append(self._normalize(obj))
+                except Exception:
+                    bad += 1
+            if bad:
+                print(f"[Dataset] 跳过损坏行: {bad}")
+
+    # ====== Dataset 接口 ======
+    def __len__(self):  # type: ignore
+        return len(self.samples)
+
+    def __getitem__(self, idx):  # type: ignore
+        s = self.samples[idx]
+        return {
+            "input_ids": torch.tensor(s["input_ids"], dtype=torch.long),
+            "attention_mask": torch.tensor(s["attention_mask"], dtype=torch.long),
+            "labels": torch.tensor(s["labels"], dtype=torch.long),
+        }
+
+
+class PreTokenizedCollator:
+    def __init__(self, pad_token_id: int = 0):
+        self.pad_token_id = pad_token_id
+
+    def __call__(self, features: List[Dict[str, torch.Tensor]]):
+        max_len = max(f["input_ids"].size(0) for f in features)
+        ids_batch, mask_batch, label_batch = [], [], []
+        for f in features:
+            ids = f["input_ids"]
+            mask = f["attention_mask"]
+            pad_len = max_len - ids.size(0)
+            if pad_len > 0:
+                ids = torch.nn.functional.pad(
+                    ids, (0, pad_len), value=self.pad_token_id
+                )
+                mask = torch.nn.functional.pad(mask, (0, pad_len), value=0)
+            ids_batch.append(ids)
+            mask_batch.append(mask)
+            label_batch.append(f["labels"])
+        return {
+            "input_ids": torch.stack(ids_batch),
+            "attention_mask": torch.stack(mask_batch),
+            "labels": torch.stack(label_batch),
+        }
 
 
 class TensorBoardCallback(TrainerCallback):
     """自定义TensorBoard回调，用于记录更多的训练指标"""
-    
+
     def __init__(self, log_dir):
         self.log_dir = log_dir
         self.writer = None
-    
+
     def on_train_begin(self, args, state, control, model=None, **kwargs):
         if self.writer is None:
             self.writer = SummaryWriter(log_dir=self.log_dir)
             print(f"TensorBoard 日志目录: {self.log_dir}")
             print(f"启动TensorBoard命令: tensorboard --logdir={self.log_dir}")
-    
+
     def on_log(self, args, state, control, model=None, logs=None, **kwargs):
         if self.writer and logs:
             for key, value in logs.items():
                 if isinstance(value, (int, float)):
                     self.writer.add_scalar(key, value, state.global_step)
-    
+
     def on_evaluate(self, args, state, control, model=None, metrics=None, **kwargs):
         if self.writer and metrics:
             for key, value in metrics.items():
-                if isinstance(value, (int, float)) and key.startswith('eval_'):
-                    self.writer.add_scalar(f"evaluation/{key}", value, state.global_step)
-    
+                if isinstance(value, (int, float)) and key.startswith("eval_"):
+                    self.writer.add_scalar(
+                        f"evaluation/{key}", value, state.global_step
+                    )
+
     def on_train_end(self, args, state, control, **kwargs):
         if self.writer:
             self.writer.close()
@@ -52,17 +175,21 @@ class TensorBoardCallback(TrainerCallback):
 def main():
     parser = argparse.ArgumentParser(description="BERT模型微调训练脚本")
     # 新的配置文件使用统一的 config.json，其中包含 trainConfig 节点
-    parser.add_argument("--config_file", default="config/config.json", help="配置文件路径 (包含 trainConfig 节点)")
+    parser.add_argument(
+        "--config_file",
+        default="config/config.json",
+        help="配置文件路径 (包含 trainConfig 节点)",
+    )
     cli_args = parser.parse_args()
 
     # 从JSON文件加载配置，并取得 trainConfig 部分
-    with open(cli_args.config_file, 'r', encoding='utf-8') as f:
+    with open(cli_args.config_file, "r", encoding="utf-8") as f:
         full_config = json.load(f)
 
-    if 'trainConfig' not in full_config:
+    if "trainConfig" not in full_config:
         raise ValueError("配置文件缺少 'trainConfig' 节点，请检查 config.json 结构。")
 
-    train_cfg_dict = full_config['trainConfig']
+    train_cfg_dict = full_config["trainConfig"]
 
     # 为了方便访问，将字典转换为对象（不考虑旧格式兼容）
     class ConfigObject:
@@ -83,18 +210,21 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"使用设备: {device}")
 
+    strategy = args.dataset_strategy
     if device.type == "cuda":
         num_gpus = torch.cuda.device_count()
         print(f"可用GPU数量: {num_gpus}")
         for i in range(num_gpus):
-            print(f"  GPU {i}: {torch.cuda.get_device_name(i)} - 显存: {torch.cuda.get_device_properties(i).total_memory / 1024**3:.1f} GB")
+            print(
+                f"  GPU {i}: {torch.cuda.get_device_name(i)} - 显存: {torch.cuda.get_device_properties(i).total_memory / 1024**3:.1f} GB"
+            )
 
     # 批次大小设置
     if args.per_device_train_batch_size is None:
         train_batch_size = 16 if device.type == "cuda" else 4
     else:
         train_batch_size = args.per_device_train_batch_size
-    
+
     if args.per_device_eval_batch_size is None:
         eval_batch_size = train_batch_size
     else:
@@ -133,7 +263,7 @@ def main():
         warmup_ratio=args.warmup_ratio,
         weight_decay=args.weight_decay,
         logging_steps=args.logging_steps,
-    eval_strategy="epoch",  # 兼容当前 transformers 版本使用的参数名
+        eval_strategy="epoch",  # 兼容当前 transformers 版本使用的参数名
         save_strategy="epoch",
         load_best_model_at_end=True,
         save_total_limit=args.save_total_limit,
@@ -159,81 +289,77 @@ def main():
         id2label=id2label,
         label2id=label2id,
     )
-    
+
     # 使用BertTokenizer，确保兼容性
     tokenizer = BertTokenizer.from_pretrained(args.model, do_lower_case=True)
-    
+
     # 使用BertForSequenceClassification进行分类任务
     model = BertForSequenceClassification.from_pretrained(
         args.model,
         config=config,
     )
-    
+
     print(f"加载的模型: {args.model}")
     print(f"标签数量: {num_labels}")
     print(f"标签映射: {label2id}")
 
-    # 3. 加载已经预处理和分词的数据集
-    # 注意：这里的train_file和validation_file应该指向split_dataset.py生成的文件
-    datasets = load_dataset(
-        "json",
-        data_files={"train": args.train_file, "validation": args.validation_file},
-    )
+    # 3. 自定义数据集加载 (可设置策略 environment variable: DATASET_STRATEGY=memory|stream)
+    train_dataset = JsonlClassificationDataset(args.train_file, strategy=strategy)
+    eval_dataset = JsonlClassificationDataset(args.validation_file, strategy=strategy)
+    print(f"训练集大小: {len(train_dataset)} (strategy={strategy})")
+    print(f"验证集大小: {len(eval_dataset)} (strategy={strategy})")
 
-    # 明确类型转换，避免静态检查器报错
-    train_dataset = cast(HFDataset, datasets["train"])  # type: ignore
-    eval_dataset = cast(HFDataset, datasets["validation"])  # type: ignore
-    
-    print(f"训练集大小: {len(train_dataset)}")
-    print(f"验证集大小: {len(eval_dataset)}")
-
-    # 4. 设置训练器，使用BERT特定的数据整理器
-    # 由于数据已经分词并转换为ID，我们只需要一个简单的padding整理器
-    data_collator = DataCollatorWithPadding(tokenizer=tokenizer, padding=True)
+    # 4. 数据已分词，使用自定义动态 padding 整理器
+    data_collator = PreTokenizedCollator(pad_token_id=tokenizer.pad_token_id or 0)
 
     # 定义评估指标
     def compute_metrics(eval_pred):
         predictions, labels = eval_pred
         predictions = np.argmax(predictions, axis=1)
-        
+
         # 计算准确率
         accuracy = np.mean(predictions == labels)
-        
+
         # 计算精确率、召回率和F1分数
         from sklearn.metrics import precision_recall_fscore_support, confusion_matrix
-        precision, recall, f1, _ = precision_recall_fscore_support(labels, predictions, average='binary', zero_division=0)
-        
+
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            labels, predictions, average="binary", zero_division=0
+        )
+
         # 计算混淆矩阵，并确保其为2x2
         cm = confusion_matrix(labels, predictions, labels=[0, 1])
-        
+
         # 安全地解包混淆矩阵
         if cm.size == 4:
             tn, fp, fn, tp = cm.ravel()
         else:
             # 如果矩阵不是2x2（例如，只有一个类别出现），则手动设置值
             if len(np.unique(labels)) == 1:
-                if np.unique(labels)[0] == 1: # 只有正例
+                if np.unique(labels)[0] == 1:  # 只有正例
                     tp = cm[0][0] if cm.size == 1 else 0
                     tn, fp, fn = 0, 0, 0
-                else: # 只有负例
+                else:  # 只有负例
                     tn = cm[0][0] if cm.size == 1 else 0
                     tp, fp, fn = 0, 0, 0
-            else: # 理论上不应该发生，但作为保险
+            else:  # 理论上不应该发生，但作为保险
                 tn, fp, fn, tp = 0, 0, 0, 0
-        
+
         return {
-            'accuracy': accuracy,
-            'precision': precision,
-            'recall': recall,
-            'f1': f1,
-            'true_positives': int(tp),
-            'true_negatives': int(tn),
-            'false_positives': int(fp),
-            'false_negatives': int(fn),
+            "accuracy": accuracy,
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "true_positives": int(tp),
+            "true_negatives": int(tn),
+            "false_positives": int(fp),
+            "false_negatives": int(fn),
         }
 
     # 准备回调函数
-    callbacks: list[TrainerCallback] = [TensorBoardCallback(tensorboard_log_dir)]  # 显式类型注解
+    callbacks: list[TrainerCallback] = [
+        TensorBoardCallback(tensorboard_log_dir)
+    ]  # 显式类型注解
 
     trainer = Trainer(
         model=model,
@@ -260,7 +386,7 @@ def main():
 
     print("训练和评估完成!")
     # 检查tensorboard_log_dir是否存在来决定是否打印信息
-    if 'tensorboard_log_dir' in locals() and tensorboard_log_dir:
+    if "tensorboard_log_dir" in locals() and tensorboard_log_dir:
         print(f"\n=== TensorBoard 可视化 ===")
         print(f"TensorBoard 日志保存在: {tensorboard_log_dir}")
         print(f"启动 TensorBoard 查看训练过程:")
