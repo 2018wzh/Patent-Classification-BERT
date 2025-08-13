@@ -222,6 +222,29 @@ def main():
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
         print(f"设置 CUDA_VISIBLE_DEVICES='{args.gpus}'")
 
+    # 关闭 tokenizers 多线程以减少多进程冲突
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+    # 打印环境诊断信息
+    def _env_diag():
+        print("=== 环境诊断 ===")
+        try:
+            import torch
+            print(f"torch={torch.__version__} cuda.is_available={torch.cuda.is_available()}")
+            if torch.cuda.is_available():
+                try:
+                    import torch.version as torch_version  # type: ignore
+                    cuda_ver = getattr(torch_version, 'cuda', 'unknown')
+                except Exception:
+                    cuda_ver = 'unknown'
+                cudnn_ver = torch.backends.cudnn.version() if torch.backends.cudnn.is_available() else 'NA'
+                print(f"编译支持的CUDA: {cuda_ver}  cuDNN: {cudnn_ver}")
+        except Exception as e:
+            print(f"[env] 诊断失败: {e}")
+        print(f"OS={os.name}  PID={os.getpid()}")
+        print("==============")
+    _env_diag()
+
     # 自动检测设备并打印信息
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"使用设备: {device}")
@@ -234,6 +257,8 @@ def main():
             print(
                 f"  GPU {i}: {torch.cuda.get_device_name(i)} - 显存: {torch.cuda.get_device_properties(i).total_memory / 1024**3:.1f} GB"
             )
+        if torch.cuda.device_count() > 1 and os.name == 'nt':
+            print("[警告] Windows 多卡训练易出现底层 core dump (gloo/NCCL 限制)。建议使用: (1) WSL2 + Ubuntu + torchrun; 或 (2) 仅使用单卡；或 (3) 在 Linux 服务器上训练。")
 
     # 批次大小设置
     if args.per_device_train_batch_size is None:
@@ -249,8 +274,10 @@ def main():
     # FP16设置
     use_fp16 = device.type == "cuda"  # 默认GPU使用FP16，CPU不使用
 
-    # 梯度检查点设置
-    use_gradient_checkpointing = device.type == "cuda"  # 默认GPU使用梯度检查点
+    # 梯度检查点设置 (Windows 多卡时可能触发不稳定 / OOM, 先禁用)
+    use_gradient_checkpointing = device.type == "cuda"
+    if os.name == 'nt' and torch.cuda.device_count() > 1:
+        use_gradient_checkpointing = False
 
     # 数据加载器内存固定
     use_pin_memory = args.dataloader_pin_memory or (device.type == "cuda")
@@ -394,12 +421,16 @@ def main():
         model.config.max_position_embeddings = new_len
 
     if train_packed and eval_packed:
-        packed_seq_len = train_dataset.input_ids.size(1)
-        if packed_seq_len > model_max_pos:
-            _maybe_resize_position_embeddings(model, packed_seq_len)
-            effective_seq_len = packed_seq_len
+        # 只有 PackedTensorDataset 才有 input_ids attribute
+        if hasattr(train_dataset, 'input_ids'):
+            packed_seq_len = train_dataset.input_ids.size(1)  # type: ignore
+            if packed_seq_len > model_max_pos:
+                _maybe_resize_position_embeddings(model, packed_seq_len)
+                effective_seq_len = packed_seq_len
+            print(f"使用打包张量数据集: 序列定长 {packed_seq_len} (有效长度={effective_seq_len}) 跳过动态 padding")
+        else:
+            print("[警告] 期望打包数据集具有 input_ids 张量, 但未找到, 仍继续训练。")
         data_collator = None
-        print(f"使用打包张量数据集: 序列定长 {packed_seq_len} (有效长度={effective_seq_len}) 跳过动态 padding")
     else:
         if effective_seq_len < model_max_pos:
             print(f"[信息] 将训练序列截断到 {effective_seq_len} <= 模型最大 {model_max_pos}")
@@ -464,18 +495,28 @@ def main():
         callbacks=callbacks,
     )
 
-    # 5. 训练
-    train_result = trainer.train()
-    metrics = train_result.metrics
-    trainer.save_model()
-    trainer.log_metrics("train", metrics)
-    trainer.save_metrics("train", metrics)
-    trainer.save_state()
+    # 5. 训练 & 评估 - 加保护捕获潜在 core dump 前的 Python 异常线索
+    try:
+        train_result = trainer.train()
+        metrics = train_result.metrics
+        trainer.save_model()
+        trainer.log_metrics("train", metrics)
+        trainer.save_metrics("train", metrics)
+        trainer.save_state()
 
-    # 6. 评估
-    metrics = trainer.evaluate()
-    trainer.log_metrics("eval", metrics)
-    trainer.save_metrics("eval", metrics)
+        metrics = trainer.evaluate()
+        trainer.log_metrics("eval", metrics)
+        trainer.save_metrics("eval", metrics)
+    except RuntimeError as e:
+        print(f"[训练RuntimeError] {e}")
+        print("排查建议: \n"
+              "1. 降低 per_device_train_batch_size (例如减半)。\n"
+              "2. 设置环境变量 TORCH_USE_CUDA_DSA=1 以捕获越界 (Linux).\n"
+              "3. 关闭梯度检查点 use_gradient_checkpointing=False。\n"
+              "4. 若是 CUDNN 状态错误, 设置 torch.backends.cudnn.deterministic=True。\n"
+              "5. 使用单卡验证是否稳定, 再扩展多卡。\n"
+              "6. 在 Linux/WSL2 下使用: torchrun --nproc_per_node=<gpus> train.py --config_file config/config.json")
+        raise
 
     print("训练和评估完成!")
     # 检查tensorboard_log_dir是否存在来决定是否打印信息
