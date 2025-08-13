@@ -97,18 +97,25 @@ def unify_record(row: Dict[str, str], field_mapping: Dict[str, str], label_field
 
 
 def process_csv_file(path: str, field_mapping: Dict[str, str], label_field_cn: str) -> List[Dict[str, Any]]:
-    data: List[Dict[str, Any]] = []
+    """
+    将CSV文件完全读入内存后进行处理
+    """
+    print(f'正在读取文件到内存: {os.path.basename(path)}')
     
-    # 首先计算总行数（用于进度条）
-    print(f'正在计算文件行数: {os.path.basename(path)}')
-    with open(path, 'r', encoding='utf-8') as f:
-        total_lines = sum(1 for _ in f) - 1  # 减去标题行
-    
+    # 第一步：将整个CSV文件读入内存
+    all_rows = []
     with open(path, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
-        # 使用 tqdm 包装迭代器
-        for row in tqdm(reader, total=total_lines, desc=f'处理 {os.path.basename(path)}', unit='行'):
-            data.append(unify_record(row, field_mapping, label_field_cn))
+        all_rows = list(reader)
+    
+    print(f'文件已读入内存，共 {len(all_rows)} 行数据')
+    
+    # 第二步：在内存中处理所有行
+    data: List[Dict[str, Any]] = []
+    for row in tqdm(all_rows, desc=f'处理 {os.path.basename(path)}', unit='行'):
+        processed_record = unify_record(row, field_mapping, label_field_cn)
+        data.append(processed_record)
+    
     return data
 
 
@@ -137,19 +144,39 @@ def main():
     all_records: List[Dict[str, Any]] = []
     print(f'共需处理 {len(convert_files)} 个文件')
     
-    for rel in tqdm(convert_files, desc='处理文件', unit='文件'):
+    # 逐个文件处理，每个文件完全读入内存后处理
+    for i, rel in enumerate(convert_files, 1):
+        print(f'\n--- 处理第 {i}/{len(convert_files)} 个文件 ---')
+        
+        # 解析文件路径
         csv_path = rel if os.path.isabs(rel) else os.path.join(os.path.dirname(config_path), '..', rel).replace('..'+os.sep+os.sep, '..'+os.sep)
         if not os.path.exists(csv_path):
             csv_path = rel if os.path.isabs(rel) else os.path.join(os.getcwd(), rel)
         if not os.path.exists(csv_path):
             print(f'警告: 找不到文件 {rel}, 已跳过')
             continue
-        records = process_csv_file(csv_path, field_mapping, label_field_cn)
-        all_records.extend(records)
+        
+        print(f'文件路径: {csv_path}')
+        
+        # 处理单个文件（完全读入内存）
+        try:
+            records = process_csv_file(csv_path, field_mapping, label_field_cn)
+            print(f'成功处理 {len(records)} 条记录')
+            all_records.extend(records)
+            print(f'累计记录数: {len(all_records)}')
+        except Exception as e:
+            print(f'错误: 处理文件 {csv_path} 时出错: {e}')
+            continue
 
+    print(f'\n=== 文件处理完成 ===')
+    print(f'总共处理了 {len(all_records)} 条记录')
+
+    # 批量验证所有记录的标签
+    print(f'\n--- 开始验证标签 ---')
     # 仅使用配置的 validLabels 进行前缀模糊匹配
     cfg_valid = cfg.get('validLabels') or []
     cfg_valid_norm = sorted(set(normalize_single_ipc(v) for v in cfg_valid if v), key=lambda x: (-len(x), x))
+    print(f'有效标签前缀: {cfg_valid_norm}')
 
     def fuzzy_valid(codes: List[str]) -> bool:
         for c in codes:
@@ -159,16 +186,34 @@ def main():
                     return True
         return False
 
+    # 批量验证标签（在内存中处理）
+    valid_count = 0
+    invalid_count = 0
+    
     for r in tqdm(all_records, desc='验证标签', unit='记录'):
         val = fuzzy_valid(r.get('labels', []))
         r['valid'] = val
+        if val:
+            valid_count += 1
+        else:
+            invalid_count += 1
     
+    print(f'标签验证完成:')
+    print(f'  有效记录: {valid_count} ({valid_count/len(all_records)*100:.1f}%)')
+    print(f'  无效记录: {invalid_count} ({invalid_count/len(all_records)*100:.1f}%)')
+
+    # 写入输出文件
+    print(f'\n--- 写入输出文件 ---')
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
-    print('正在写入输出文件...')
+    print(f'正在写入输出文件: {output_file}')
+    
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(all_records, f, ensure_ascii=False, indent=2)
 
-    print(f'完成: {len(all_records)} 条记录 -> {output_file} (含 valid 字段, 不输出独立 valid_labels.json)')
+    print(f'\n=== 处理完成 ===')
+    print(f'总记录数: {len(all_records)}')
+    print(f'有效记录: {valid_count}')
+    print(f'输出文件: {output_file}')
 
 
 if __name__ == '__main__':
