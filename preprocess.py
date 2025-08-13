@@ -2,7 +2,7 @@ import csv
 import json
 import sys
 import os
-from typing import Dict, Any, List, Set
+from typing import Dict, Any, List, Set, Optional
 from tqdm import tqdm
 
 DEFAULT_CONFIG_PATH = os.path.join('config', 'config.json')
@@ -58,7 +58,24 @@ def derive_label(ipc_main: str) -> str:
     return before_slash
 
 
-def unify_record(row: Dict[str, str], field_mapping: Dict[str, str], label_field_cn: str) -> Dict[str, Any]:
+def clean_text_content(text: str, remove_keywords: List[str]) -> str:
+    """
+    根据配置的关键字清洗文本内容
+    """
+    if not text or not remove_keywords:
+        return text
+    
+    cleaned_text = text
+    for keyword in remove_keywords:
+        if keyword in cleaned_text:
+            cleaned_text = cleaned_text.replace(keyword, '')
+    
+    # 清理多余的空白字符
+    cleaned_text = ' '.join(cleaned_text.split())
+    return cleaned_text
+
+
+def unify_record(row: Dict[str, str], field_mapping: Dict[str, str], label_field_cn: str, remove_keywords: Optional[List[str]] = None) -> Dict[str, Any]:
     # 标准化 IPC
     all_ipc_raw = row.get('IPC分类号', '')
     main_ipc_raw = row.get('IPC主分类号', '')
@@ -80,11 +97,18 @@ def unify_record(row: Dict[str, str], field_mapping: Dict[str, str], label_field
         label_set.discard('UNKNOWN')
     labels = sorted(label_set)
 
-    parts = [
-        row.get('专利名称', ''),
-        row.get('摘要文本', ''),
-        row.get('主权项内容', ''),
-    ]
+    # 获取文本内容并进行清洗
+    patent_name = row.get('专利名称', '')
+    abstract = row.get('摘要文本', '')
+    claims = row.get('主权项内容', '')
+    
+    # 如果有配置的关键字，则进行清洗
+    if remove_keywords:
+        patent_name = clean_text_content(patent_name, remove_keywords)
+        abstract = clean_text_content(abstract, remove_keywords)
+        claims = clean_text_content(claims, remove_keywords)
+    
+    parts = [patent_name, abstract, claims]
     text = '\n'.join([p for p in parts if p])
 
     grant_no = row.get('授权公告号', '').strip()
@@ -96,7 +120,7 @@ def unify_record(row: Dict[str, str], field_mapping: Dict[str, str], label_field
     }
 
 
-def process_csv_file(path: str, field_mapping: Dict[str, str], label_field_cn: str) -> List[Dict[str, Any]]:
+def process_csv_file(path: str, field_mapping: Dict[str, str], label_field_cn: str, remove_keywords: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     """
     将CSV文件完全读入内存后进行处理
     """
@@ -113,7 +137,7 @@ def process_csv_file(path: str, field_mapping: Dict[str, str], label_field_cn: s
     # 第二步：在内存中处理所有行
     data: List[Dict[str, Any]] = []
     for row in tqdm(all_rows, desc=f'处理 {os.path.basename(path)}', unit='行'):
-        processed_record = unify_record(row, field_mapping, label_field_cn)
+        processed_record = unify_record(row, field_mapping, label_field_cn, remove_keywords)
         data.append(processed_record)
     
     return data
@@ -140,6 +164,14 @@ def main():
         print('config 缺少 fieldMapping')
         sys.exit(1)
     label_field_cn = cfg.get('labelField', 'IPC主分类号')
+    
+    # 读取数据清洗配置
+    remove_keywords = cfg.get('removeKeywords', [])
+    if remove_keywords:
+        print(f'数据清洗配置: 将删除 {len(remove_keywords)} 个关键字')
+        print(f'关键字列表: {remove_keywords}')
+    else:
+        print('未配置数据清洗关键字')
 
     all_records: List[Dict[str, Any]] = []
     print(f'共需处理 {len(convert_files)} 个文件')
@@ -160,7 +192,7 @@ def main():
         
         # 处理单个文件（完全读入内存）
         try:
-            records = process_csv_file(csv_path, field_mapping, label_field_cn)
+            records = process_csv_file(csv_path, field_mapping, label_field_cn, remove_keywords)
             print(f'成功处理 {len(records)} 条记录')
             all_records.extend(records)
             print(f'累计记录数: {len(all_records)}')
