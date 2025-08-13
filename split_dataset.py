@@ -3,13 +3,14 @@ from typing import List, Dict, Any, Tuple
 from tqdm import tqdm
 
 # 默认路径
-DEFAULT_INPUT = os.path.join('dataset', 'data.json')
+DEFAULT_INPUT = os.path.join('dataset', 'tokenized_data.jsonl')
 DEFAULT_OUT_DIR = 'dataset'
+DEFAULT_CONFIG_FILE = os.path.join('config', 'config.json')
 
 
 def load_data(path: str) -> List[Dict[str, Any]]:
     """
-    将数据文件完全读入内存
+    将数据文件（json或jsonl）完全读入内存
     """
     print(f'正在读取数据文件: {path}')
     
@@ -23,12 +24,18 @@ def load_data(path: str) -> List[Dict[str, Any]]:
     print(f'文件大小: {file_size / 1024 / 1024:.2f} MB')
     
     # 读取数据到内存
+    records = []
     with open(path, 'r', encoding='utf-8') as f:
-        print('正在解析JSON数据...')
-        data = json.load(f)
+        if path.endswith('.jsonl'):
+            print('正在解析JSONL数据...')
+            for line in tqdm(f, desc=f"读取 {os.path.basename(path)}", unit='行'):
+                records.append(json.loads(line))
+        else:
+            print('正在解析JSON数据...')
+            records = json.load(f)
     
-    print(f'数据已读入内存，共 {len(data)} 条记录')
-    return data
+    print(f'数据已读入内存，共 {len(records)} 条记录')
+    return records
 
 
 def write_jsonl(path: str, records: List[Dict[str, Any]]):
@@ -109,29 +116,47 @@ def compute_stats(name: str, data: List[Dict[str, Any]], label_key: str) -> Dict
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Split dataset into train/val/test')
-    parser.add_argument('--input', default=DEFAULT_INPUT, help='输入 data.json 路径')
-    parser.add_argument('--outdir', default=DEFAULT_OUT_DIR, help='输出目录')
-    parser.add_argument('--label-key', default='valid', help='主标签键名')
-    parser.add_argument('--ratios', default='0.8,0.1,0.1', help='train,val,test 比例')
-    parser.add_argument('--seed', type=int, default=42, help='随机种子')
+    parser = argparse.ArgumentParser(description='Split dataset into train/val/test (支持统一 config.json 的 splitConfig)')
+    parser.add_argument('--config_file', default=DEFAULT_CONFIG_FILE, help='配置文件 (包含 splitConfig) 路径')
+    parser.add_argument('--input', default=None, help='输入 data.json 路径 (若提供则覆盖配置)')
+    parser.add_argument('--outdir', default=None, help='输出目录 (若提供则覆盖配置)')
+    parser.add_argument('--label-key', default=None, help='主标签键名 (若提供则覆盖配置)')
+    parser.add_argument('--ratios', default=None, help='train,val,test 比例 (若提供则覆盖配置)')
+    parser.add_argument('--seed', type=int, default=None, help='随机种子 (若提供则覆盖配置)')
     args = parser.parse_args()
 
+    # 读取配置文件
+    if not os.path.exists(args.config_file):
+        print(f'错误: 配置文件不存在 {args.config_file}')
+        sys.exit(1)
+    with open(args.config_file, 'r', encoding='utf-8') as f:
+        full_cfg = json.load(f)
+    split_cfg = full_cfg.get('splitConfig') or {}
+
+    # 从 splitConfig 读取，CLI 非空则覆盖
+    input_path = args.input or split_cfg.get('input', DEFAULT_INPUT)
+    outdir = args.outdir or split_cfg.get('outdir', DEFAULT_OUT_DIR)
+    label_key = args.label_key or split_cfg.get('label_key', 'label')
+    ratios_raw = args.ratios or split_cfg.get('ratios', '0.8,0.1,0.1')
+    seed = args.seed if args.seed is not None else split_cfg.get('seed', 42)
+
     print('=== 数据集划分工具 ===')
-    print(f'输入文件: {args.input}')
-    print(f'输出目录: {args.outdir}')
-    print(f'标签键: {args.label_key}')
-    print(f'划分比例: {args.ratios}')
+    print(f'配置文件: {args.config_file}')
+    print(f'输入文件: {input_path}')
+    print(f'输出目录: {outdir}')
+    print(f'标签键: {label_key}')
+    print(f'划分比例: {ratios_raw}')
+    print(f'随机种子: {seed}')
 
     # 解析划分比例
-    ratios_tuple = tuple(float(x) for x in args.ratios.split(','))
+    ratios_tuple = tuple(float(x) for x in (ratios_raw if isinstance(ratios_raw, str) else ','.join(map(str, ratios_raw))).split(','))
     if len(ratios_tuple) != 3 or not math.isclose(sum(ratios_tuple), 1.0, rel_tol=1e-3):
         print('错误: 比例必须是3个数字且和为1.0')
         sys.exit(1)
 
     # 第一步：读取数据到内存
     print(f'\n--- 第1步: 读取数据 ---')
-    data = load_data(args.input)
+    data = load_data(input_path)
     if not data:
         print('数据为空，退出')
         sys.exit(0)
@@ -142,13 +167,13 @@ def main():
 
     # 第三步：创建输出目录并写入文件
     print(f'\n--- 第3步: 写入文件 ---')
-    os.makedirs(args.outdir, exist_ok=True)
+    os.makedirs(outdir, exist_ok=True)
     
     # 并行写入三个文件
     files_to_write = [
-        (os.path.join(args.outdir, 'train.jsonl'), train),
-        (os.path.join(args.outdir, 'val.jsonl'), val),
-        (os.path.join(args.outdir, 'test.jsonl'), test)
+    (os.path.join(outdir, 'train.jsonl'), train),
+    (os.path.join(outdir, 'val.jsonl'), val),
+    (os.path.join(outdir, 'test.jsonl'), test)
     ]
     
     for filepath, dataset in files_to_write:
@@ -168,7 +193,7 @@ def main():
         }
     ]
     
-    stats_file = os.path.join(args.outdir, 'split_stats.json')
+    stats_file = os.path.join(outdir, 'split_stats.json')
     print(f'正在保存统计信息到: {stats_file}')
     with open(stats_file, 'w', encoding='utf-8') as f:
         json.dump(stats, f, ensure_ascii=False, indent=2)
@@ -179,7 +204,7 @@ def main():
     print(f'验证集: {len(val)} 条')
     print(f'测试集: {len(test)} 条')
     print(f'总计: {len(data)} 条')
-    print(f'输出目录: {args.outdir}')
+    print(f'输出目录: {outdir}')
     print(f'统计文件: {stats_file}')
 
 

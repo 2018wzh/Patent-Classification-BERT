@@ -4,14 +4,63 @@ import sys
 import os
 from typing import Dict, Any, List, Set, Optional
 from tqdm import tqdm
+from transformers import BertTokenizer
 
-DEFAULT_CONFIG_PATH = os.path.join("config", "config.json")
+DEFAULT_CONFIG_PATH = os.path.join("config", "config.json")  # 统一配置文件
 
 
 def load_config(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    return cfg
+        return json.load(f)
+
+
+def tokenize_and_format(records: List[Dict[str, Any]], train_config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    使用BERT分词器对记录进行分词和格式化。
+    """
+    model_name = train_config.get("model")
+    if not model_name:
+        print("错误: 训练配置中缺少 'model' 名称。")
+        sys.exit(1)
+
+    print(f"\n--- 开始分词和格式化 ---")
+    print(f"加载分词器: {model_name}")
+    tokenizer = BertTokenizer.from_pretrained(model_name, do_lower_case=True)
+    
+    max_seq_length = train_config.get("max_seq_length", 512)
+    text_column = train_config.get("text_column_name", "text")
+    label_column = train_config.get("label_column_name", "valid")
+
+    print(f"最大序列长度: {max_seq_length}")
+
+    tokenized_records = []
+    for record in tqdm(records, desc="正在分词", unit="条"):
+        # BERT分词，添加特殊tokens
+        # 注意：这里不进行padding，padding将在训练时由DataCollator完成
+        tokenized_output = tokenizer(
+            record[text_column],
+            padding=False,
+            max_length=max_seq_length,
+            truncation=True,
+            add_special_tokens=True,
+            return_attention_mask=True,
+        )
+        
+        # 将布尔值转换为整数标签
+        label = 1 if record[label_column] else 0
+        
+        formatted_record = {
+            "input_ids": tokenized_output["input_ids"],
+            "attention_mask": tokenized_output["attention_mask"],
+            "label": label,
+            "original_id": record.get("id", "") # 保留原始ID以便追溯
+        }
+        tokenized_records.append(formatted_record)
+        
+    print("分词和格式化完成。")
+    return tokenized_records
+
+
 
 
 def normalize_single_ipc(code: str) -> str:
@@ -156,15 +205,18 @@ def main():
         print(f"配置文件不存在: {config_path}")
         sys.exit(1)
 
-    cfg = load_config(config_path)
-    convert_files = cfg.get("convertFiles", [])
-    output_file = cfg.get("outputFile")
-    if not output_file:
-        print("config 缺少 outputFile")
+    full_cfg = load_config(config_path)
+    if 'preprocessConfig' not in full_cfg or 'trainConfig' not in full_cfg:
+        print("配置文件需包含 'preprocessConfig' 与 'trainConfig' 两个节点。")
         sys.exit(1)
 
+    preprocess_cfg = full_cfg['preprocessConfig']
+    train_cfg = full_cfg['trainConfig']
+
+    convert_files = preprocess_cfg.get("convertFiles", [])
+
     # 读取数据清洗配置
-    remove_keywords = cfg.get("removeKeywords", [])
+    remove_keywords = preprocess_cfg.get("removeKeywords", [])
     if remove_keywords:
         print(f"数据清洗配置: 将删除 {len(remove_keywords)} 个关键字")
         print(f"关键字列表: {remove_keywords}")
@@ -210,7 +262,7 @@ def main():
     # 批量验证所有记录的标签
     print(f"\n--- 开始验证标签 ---")
     # 仅使用配置的 validLabels 进行前缀模糊匹配
-    cfg_valid = cfg.get("validLabels") or []
+    cfg_valid = preprocess_cfg.get("validLabels") or []
     cfg_valid_norm = sorted(
         set(normalize_single_ipc(v) for v in cfg_valid if v), key=lambda x: (-len(x), x)
     )
@@ -225,33 +277,55 @@ def main():
         return False
 
     # 批量验证标签（在内存中处理）
-    valid_count = 0
+    valid_records = []
     invalid_count = 0
 
     for r in tqdm(all_records, desc="验证标签", unit="记录"):
         val = fuzzy_valid(r.get("labels", []))
         r["valid"] = val
         if val:
-            valid_count += 1
+            valid_records.append(r)
         else:
             invalid_count += 1
+    
+    valid_count = len(valid_records)
+    total_count = len(all_records)
 
     print(f"标签验证完成:")
-    print(f"  有效记录: {valid_count} ({valid_count/len(all_records)*100:.1f}%)")
-    print(f"  无效记录: {invalid_count} ({invalid_count/len(all_records)*100:.1f}%)")
+    print(f"  有效记录: {valid_count} ({valid_count/total_count*100:.1f}%)")
+    print(f"  无效记录: {invalid_count} ({invalid_count/total_count*100:.1f}%)")
+
+    # 加载训练配置并进行分词
+    print(f"\n--- 加载训练配置 ---")
+    train_config = train_cfg
+    print(f"已读取 trainConfig 节点，共 {len(train_config)} 个键")
+
+    # 对验证通过的记录进行分词
+    tokenized_data = tokenize_and_format(valid_records, train_config)
 
     # 写入输出文件
     print(f"\n--- 写入输出文件 ---")
-    os.makedirs(os.path.dirname(output_file), exist_ok=True)
-    print(f"正在写入输出文件: {output_file}")
+    # 统一输出到 dataset 目录（与既有脚本其他部分一致）
+    output_dir = os.path.join('dataset')
+    os.makedirs(output_dir, exist_ok=True)
 
-    with open(output_file, "w", encoding="utf-8") as f:
+    raw_output_file = os.path.join(output_dir, "data_origin.json")
+    print(f"正在写入带标签的原始数据: {raw_output_file}")
+    with open(raw_output_file, "w", encoding="utf-8") as f:
         json.dump(all_records, f, ensure_ascii=False, indent=2)
 
+    # 保存分词后的数据为jsonl格式，便于datasets库加载
+    tokenized_output_file = os.path.join(output_dir, "tokenized_data.jsonl")
+    print(f"正在写入分词后的数据: {tokenized_output_file}")
+    with open(tokenized_output_file, "w", encoding="utf-8") as f:
+        for record in tokenized_data:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
     print(f"\n=== 处理完成 ===")
-    print(f"总记录数: {len(all_records)}")
-    print(f"有效记录: {valid_count}")
-    print(f"输出文件: {output_file}")
+    print(f"总记录数: {total_count}")
+    print(f"有效记录 (已分词): {len(tokenized_data)}")
+    print(f"带标签的原始数据输出: {raw_output_file}")
+    print(f"分词后数据输出: {tokenized_output_file}")
 
 
 if __name__ == "__main__":

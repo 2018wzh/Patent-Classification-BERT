@@ -2,6 +2,8 @@ import json
 import argparse
 import torch
 import os
+from typing import Any, cast
+from datasets import Dataset as HFDataset
 from datasets import load_dataset
 from transformers import (
     BertConfig,
@@ -49,18 +51,28 @@ class TensorBoardCallback(TrainerCallback):
 
 def main():
     parser = argparse.ArgumentParser(description="BERT模型微调训练脚本")
-    parser.add_argument("--config_file", default="config/train_config.json", help="配置文件路径")
+    # 新的配置文件使用统一的 config.json，其中包含 trainConfig 节点
+    parser.add_argument("--config_file", default="config/config.json", help="配置文件路径 (包含 trainConfig 节点)")
     cli_args = parser.parse_args()
 
-    # 从JSON文件加载配置
+    # 从JSON文件加载配置，并取得 trainConfig 部分
     with open(cli_args.config_file, 'r', encoding='utf-8') as f:
-        config = json.load(f)
-    
-    # 为了方便访问，将字典转换为对象
+        full_config = json.load(f)
+
+    if 'trainConfig' not in full_config:
+        raise ValueError("配置文件缺少 'trainConfig' 节点，请检查 config.json 结构。")
+
+    train_cfg_dict = full_config['trainConfig']
+
+    # 为了方便访问，将字典转换为对象（不考虑旧格式兼容）
     class ConfigObject:
         def __init__(self, d):
-            self.__dict__ = d
-    args = ConfigObject(config)
+            for k, v in d.items():
+                setattr(self, k, v)
+
+    args: Any = ConfigObject(train_cfg_dict)  # 简单处理，避免类型检查器属性报错
+    print(f"加载配置文件: {cli_args.config_file}")
+    print(f"trainConfig 字段: {list(train_cfg_dict.keys())}")
 
     # 设置可见的GPU
     if args.gpus:
@@ -89,20 +101,10 @@ def main():
         eval_batch_size = args.per_device_eval_batch_size
 
     # FP16设置
-    if args.no_fp16:
-        use_fp16 = False
-    elif args.fp16:
-        use_fp16 = True
-    else:
-        use_fp16 = device.type == "cuda"  # 默认GPU使用FP16，CPU不使用
+    use_fp16 = device.type == "cuda"  # 默认GPU使用FP16，CPU不使用
 
     # 梯度检查点设置
-    if args.no_gradient_checkpointing:
-        use_gradient_checkpointing = False
-    elif args.gradient_checkpointing:
-        use_gradient_checkpointing = True
-    else:
-        use_gradient_checkpointing = device.type == "cuda"  # 默认GPU使用梯度检查点
+    use_gradient_checkpointing = device.type == "cuda"  # 默认GPU使用梯度检查点
 
     # 数据加载器内存固定
     use_pin_memory = args.dataloader_pin_memory or (device.type == "cuda")
@@ -114,18 +116,10 @@ def main():
     print(f"内存固定: {use_pin_memory}")
 
     # TensorBoard设置
-    use_tensorboard = not args.no_tensorboard
-    if use_tensorboard:
-        if args.tensorboard_log_dir:
-            tensorboard_log_dir = args.tensorboard_log_dir
-        else:
-            tensorboard_log_dir = os.path.join(args.output_dir, "tensorboard_logs")
-        os.makedirs(tensorboard_log_dir, exist_ok=True)
-        print(f"TensorBoard日志目录: {tensorboard_log_dir}")
-        print(f"启动TensorBoard命令: tensorboard --logdir={tensorboard_log_dir}")
-    else:
-        tensorboard_log_dir = None
-        print("TensorBoard记录已禁用")
+    tensorboard_log_dir = os.path.join(args.output_dir, "tensorboard_logs")
+    os.makedirs(tensorboard_log_dir, exist_ok=True)
+    print(f"TensorBoard日志目录: {tensorboard_log_dir}")
+    print(f"启动TensorBoard命令: tensorboard --logdir={tensorboard_log_dir}")
 
     # 单独创建 TrainingArguments，针对BERT优化
     training_args = TrainingArguments(
@@ -139,15 +133,15 @@ def main():
         warmup_ratio=args.warmup_ratio,
         weight_decay=args.weight_decay,
         logging_steps=args.logging_steps,
-        eval_strategy="epoch",
+    eval_strategy="epoch",  # 兼容当前 transformers 版本使用的参数名
         save_strategy="epoch",
         load_best_model_at_end=True,
         save_total_limit=args.save_total_limit,
         fp16=use_fp16,
         dataloader_pin_memory=use_pin_memory,
         gradient_checkpointing=use_gradient_checkpointing,
-        report_to="tensorboard" if use_tensorboard else None,
-        logging_dir=tensorboard_log_dir if use_tensorboard else None,
+        report_to="tensorboard",
+        logging_dir=tensorboard_log_dir,
         logging_first_step=True,
         metric_for_best_model="eval_accuracy",
         greater_is_better=True,
@@ -179,40 +173,22 @@ def main():
     print(f"标签数量: {num_labels}")
     print(f"标签映射: {label2id}")
 
-    # 3. 加载和预处理数据集
+    # 3. 加载已经预处理和分词的数据集
+    # 注意：这里的train_file和validation_file应该指向split_dataset.py生成的文件
     datasets = load_dataset(
         "json",
         data_files={"train": args.train_file, "validation": args.validation_file},
     )
 
-    def preprocess_function(examples):
-        # BERT分词，添加特殊tokens
-        result = tokenizer(
-            examples[args.text_column_name],
-            padding=False,
-            max_length=args.max_seq_length,
-            truncation=True,
-            add_special_tokens=True,  # 添加[CLS]和[SEP]
-            return_attention_mask=True,  # 返回attention mask
-        )
-        # 将布尔值转换为整数标签
-        result["label"] = [1 if val else 0 for val in examples[args.label_column_name]]
-        return result
-
-    processed_datasets = datasets.map(
-        preprocess_function,
-        batched=True,
-        remove_columns=datasets["train"].column_names,
-        desc="正在处理数据集",
-    )
-
-    train_dataset = processed_datasets["train"]
-    eval_dataset = processed_datasets["validation"]
+    # 明确类型转换，避免静态检查器报错
+    train_dataset = cast(HFDataset, datasets["train"])  # type: ignore
+    eval_dataset = cast(HFDataset, datasets["validation"])  # type: ignore
     
     print(f"训练集大小: {len(train_dataset)}")
     print(f"验证集大小: {len(eval_dataset)}")
 
     # 4. 设置训练器，使用BERT特定的数据整理器
+    # 由于数据已经分词并转换为ID，我们只需要一个简单的padding整理器
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer, padding=True)
 
     # 定义评估指标
@@ -225,27 +201,39 @@ def main():
         
         # 计算精确率、召回率和F1分数
         from sklearn.metrics import precision_recall_fscore_support, confusion_matrix
-        precision, recall, f1, _ = precision_recall_fscore_support(labels, predictions, average='binary')
+        precision, recall, f1, _ = precision_recall_fscore_support(labels, predictions, average='binary', zero_division=0)
         
-        # 计算混淆矩阵
-        tn, fp, fn, tp = confusion_matrix(labels, predictions).ravel()
+        # 计算混淆矩阵，并确保其为2x2
+        cm = confusion_matrix(labels, predictions, labels=[0, 1])
+        
+        # 安全地解包混淆矩阵
+        if cm.size == 4:
+            tn, fp, fn, tp = cm.ravel()
+        else:
+            # 如果矩阵不是2x2（例如，只有一个类别出现），则手动设置值
+            if len(np.unique(labels)) == 1:
+                if np.unique(labels)[0] == 1: # 只有正例
+                    tp = cm[0][0] if cm.size == 1 else 0
+                    tn, fp, fn = 0, 0, 0
+                else: # 只有负例
+                    tn = cm[0][0] if cm.size == 1 else 0
+                    tp, fp, fn = 0, 0, 0
+            else: # 理论上不应该发生，但作为保险
+                tn, fp, fn, tp = 0, 0, 0, 0
         
         return {
             'accuracy': accuracy,
             'precision': precision,
             'recall': recall,
             'f1': f1,
-            'true_positives': tp,
-            'true_negatives': tn,
-            'false_positives': fp,
-            'false_negatives': fn,
+            'true_positives': int(tp),
+            'true_negatives': int(tn),
+            'false_positives': int(fp),
+            'false_negatives': int(fn),
         }
 
     # 准备回调函数
-    callbacks = []
-    if use_tensorboard:
-        tb_callback = TensorBoardCallback(tensorboard_log_dir)
-        callbacks.append(tb_callback)
+    callbacks: list[TrainerCallback] = [TensorBoardCallback(tensorboard_log_dir)]  # 显式类型注解
 
     trainer = Trainer(
         model=model,
@@ -271,7 +259,8 @@ def main():
     trainer.save_metrics("eval", metrics)
 
     print("训练和评估完成!")
-    if use_tensorboard:
+    # 检查tensorboard_log_dir是否存在来决定是否打印信息
+    if 'tensorboard_log_dir' in locals() and tensorboard_log_dir:
         print(f"\n=== TensorBoard 可视化 ===")
         print(f"TensorBoard 日志保存在: {tensorboard_log_dir}")
         print(f"启动 TensorBoard 查看训练过程:")
