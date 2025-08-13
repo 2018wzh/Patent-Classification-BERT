@@ -49,57 +49,33 @@ class TensorBoardCallback(TrainerCallback):
 
 def main():
     parser = argparse.ArgumentParser(description="BERT模型微调训练脚本")
-    parser.add_argument("--model", required=True, help="预训练模型路径或模型名称")
-    parser.add_argument("--train_file", required=True, help="训练数据文件 (jsonl格式)")
-    parser.add_argument(
-        "--validation_file", required=True, help="验证数据文件 (jsonl格式)"
-    )
-    parser.add_argument("--text_column_name", default="text", help="文本列名")
-    parser.add_argument("--label_column_name", default="valid", help="标签列名")
-    parser.add_argument("--max_seq_length", type=int, default=512, help="最大序列长度")
-    parser.add_argument("--output_dir", required=True, help="输出目录")
-    
-    # 训练参数
-    parser.add_argument("--per_device_train_batch_size", type=int, default=None, help="训练批次大小")
-    parser.add_argument("--per_device_eval_batch_size", type=int, default=None, help="评估批次大小")
-    parser.add_argument("--num_train_epochs", type=int, default=3, help="训练轮数")
-    parser.add_argument("--learning_rate", type=float, default=2e-5, help="学习率")
-    parser.add_argument("--warmup_ratio", type=float, default=0.1, help="预热比例")
-    parser.add_argument("--weight_decay", type=float, default=0.01, help="权重衰减")
-    parser.add_argument("--logging_steps", type=int, default=50, help="日志记录步数")
-    parser.add_argument("--save_total_limit", type=int, default=2, help="保存模型数量限制")
-    
-    # 设备和性能参数
-    parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"], help="训练设备")
-    parser.add_argument("--gpus", default="0", help="使用的GPU ID（逗号分隔）")
-    parser.add_argument("--fp16", action="store_true", help="使用混合精度训练")
-    parser.add_argument("--no_fp16", action="store_true", help="禁用混合精度训练")
-    parser.add_argument("--gradient_checkpointing", action="store_true", help="启用梯度检查点")
-    parser.add_argument("--no_gradient_checkpointing", action="store_true", help="禁用梯度检查点")
-    parser.add_argument("--dataloader_pin_memory", action="store_true", help="启用数据加载器内存固定")
-    
-    # TensorBoard参数
-    parser.add_argument("--tensorboard_log_dir", default=None, help="TensorBoard日志目录")
-    parser.add_argument("--no_tensorboard", action="store_true", help="禁用TensorBoard记录")
-    
-    args = parser.parse_args()
+    parser.add_argument("--config_file", default="config/train_config.json", help="配置文件路径")
+    cli_args = parser.parse_args()
 
-    # 设备选择逻辑
-    if args.device == "auto":
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    elif args.device == "cuda":
-        if not torch.cuda.is_available():
-            print("警告: 指定使用CUDA但未检测到GPU，将使用CPU")
-            device = torch.device("cpu")
-        else:
-            device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
+    # 从JSON文件加载配置
+    with open(cli_args.config_file, 'r', encoding='utf-8') as f:
+        config = json.load(f)
     
+    # 为了方便访问，将字典转换为对象
+    class ConfigObject:
+        def __init__(self, d):
+            self.__dict__ = d
+    args = ConfigObject(config)
+
+    # 设置可见的GPU
+    if args.gpus:
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
+        print(f"设置 CUDA_VISIBLE_DEVICES='{args.gpus}'")
+
+    # 自动检测设备并打印信息
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"使用设备: {device}")
+
     if device.type == "cuda":
-        print(f"GPU型号: {torch.cuda.get_device_name(0)}")
-        print(f"GPU显存: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+        num_gpus = torch.cuda.device_count()
+        print(f"可用GPU数量: {num_gpus}")
+        for i in range(num_gpus):
+            print(f"  GPU {i}: {torch.cuda.get_device_name(i)} - 显存: {torch.cuda.get_device_properties(i).total_memory / 1024**3:.1f} GB")
 
     # 批次大小设置
     if args.per_device_train_batch_size is None:
@@ -199,13 +175,9 @@ def main():
         config=config,
     )
     
-    # 将模型移动到正确的设备
-    model.to(device)
-    
     print(f"加载的模型: {args.model}")
     print(f"标签数量: {num_labels}")
     print(f"标签映射: {label2id}")
-    print(f"模型设备: {next(model.parameters()).device}")
 
     # 3. 加载和预处理数据集
     datasets = load_dataset(
