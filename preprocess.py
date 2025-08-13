@@ -6,16 +6,24 @@ from typing import Dict, Any, List, Set, Optional
 from tqdm import tqdm
 from transformers import BertTokenizer
 
-DEFAULT_CONFIG_PATH = os.path.join("config", "config.json")  # 统一配置文件
+DEFAULT_CONFIG_PATH = os.path.join("config", "config.json")
 
 
 def load_config(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        cfg = json.load(f)
+    return cfg
 
 
 def tokenize_and_format(records: List[Dict[str, Any]], train_config: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """单线程分词（包含有效+无效全部数据）。"""
+    """批量高速分词 (CPU fast tokenizer)。
+
+    使用 Rust 实现的 fast tokenizer 并分批处理，显著提升吞吐，避免逐条 Python 循环的开销。
+    GPU 对 WordPiece/BPE 分词无显著收益；真正加速方式是批量 + fast tokenizer。
+
+    额外可配置项 (train_config):
+      - tokenize_batch_size: 每批文本数量 (默认 512)
+    """
     model_name = train_config.get("model")
     if not model_name:
         print("错误: 训练配置中缺少 'model' 名称。")
@@ -24,25 +32,35 @@ def tokenize_and_format(records: List[Dict[str, Any]], train_config: Dict[str, A
     max_seq_length = train_config.get("max_seq_length", 512)
     text_column = train_config.get("text_column_name", "text")
     label_column = train_config.get("label_column_name", "valid")
+    batch_size = int(train_config.get("tokenize_batch_size", 512))
 
-    print("\n--- 开始分词 (单线程) ---")
-    tokenizer = BertTokenizer.from_pretrained(model_name, do_lower_case=True)
+    print("\n--- 开始批量分词 (fast tokenizer, CPU) ---")
+    print(f"模型/分词器: {model_name}  最大序列长度: {max_seq_length}  批次: {batch_size}")
+    tokenizer = BertTokenizer.from_pretrained(model_name, use_fast=True)
+
+    texts = [rec[text_column] for rec in records]
+    labels = [1 if rec.get(label_column) else 0 for rec in records]
+    original_ids = [rec.get("id", "") for rec in records]
+    total = len(texts)
     out: List[Dict[str, Any]] = []
-    for rec in tqdm(records, desc="分词", unit="条"):
+    for start in tqdm(range(0, total, batch_size), desc="分词", unit="batch"):
+        end = min(start + batch_size, total)
+        batch_texts = texts[start:end]
         enc = tokenizer(
-            rec[text_column],
+            batch_texts,
             padding=False,
             max_length=max_seq_length,
             truncation=True,
             add_special_tokens=True,
             return_attention_mask=True,
         )
-        out.append({
-            "input_ids": enc["input_ids"],
-            "attention_mask": enc["attention_mask"],
-            "label": 1 if rec.get(label_column) else 0,
-            "original_id": rec.get("id", "")
-        })
+        for i, input_ids in enumerate(enc["input_ids"]):
+            out.append({
+                "input_ids": input_ids,
+                "attention_mask": enc["attention_mask"][i],
+                "label": labels[start + i],
+                "original_id": original_ids[start + i],
+            })
     print(f"分词完成，总样本: {len(out)}")
     return out
 
@@ -102,8 +120,7 @@ def clean_text_content(text: str, remove_keywords: List[str]) -> str:
 
     cleaned_text = text
     for keyword in remove_keywords:
-        if keyword in cleaned_text:
-            cleaned_text = cleaned_text.replace(keyword, "")
+        cleaned_text = cleaned_text.replace(keyword, "")
 
     # 清理多余的空白字符
     cleaned_text = " ".join(cleaned_text.split())
@@ -175,8 +192,11 @@ def process_csv_file(
     # 第二步：在内存中处理所有行
     data: List[Dict[str, Any]] = []
     for row in tqdm(all_rows, desc=f"处理 {os.path.basename(path)}", unit="行"):
-        data.append(unify_record(row, remove_keywords))
+        processed_record = unify_record(row, remove_keywords)
+        data.append(processed_record)
+
     return data
+
 
 def main():
     # 允许: python preprocess.py 或 python preprocess.py <config_path>
@@ -278,23 +298,16 @@ def main():
     print(f"  有效记录: {valid_count} ({valid_count/total_count*100:.1f}%)")
     print(f"  无效记录: {invalid_count} ({invalid_count/total_count*100:.1f}%)")
 
-    # 加载训练配置并进行分词
-    print(f"\n--- 加载训练配置 ---")
-    train_config = train_cfg
-    print(f"已读取 trainConfig 节点，共 {len(train_config)} 个键")
 
-    print("\n--- 构建二分类数据集 (包含全部样本) ---")
-    print(f"正类(有效)= {valid_count}  负类(无效)= {invalid_count}  总计= {total_count}")
-
-    # 对全部样本分词 (label = valid)
-    tokenized_data = tokenize_and_format(all_records, train_config)
+    # 对验证通过的记录进行分词
+    tokenized_data = tokenize_and_format(valid_records, train_cfg)
 
     # 写入输出文件
     print(f"\n--- 写入输出文件 ---")
-    # 统一输出到 dataset 目录（与既有脚本其他部分一致）
     output_dir = os.path.join('dataset')
     os.makedirs(output_dir, exist_ok=True)
-
+    
+    # 保存原始的、带有valid标签的数据
     raw_output_file = os.path.join(output_dir, "data_origin.json")
     print(f"正在写入带标签的原始数据: {raw_output_file}")
     with open(raw_output_file, "w", encoding="utf-8") as f:
@@ -309,7 +322,7 @@ def main():
 
     print(f"\n=== 处理完成 ===")
     print(f"总记录数: {total_count}")
-    print(f"已分词样本数: {len(tokenized_data)} (包含有效+无效)")
+    print(f"有效记录 (已分词): {len(tokenized_data)}")
     print(f"带标签的原始数据输出: {raw_output_file}")
     print(f"分词后数据输出: {tokenized_output_file}")
 
