@@ -148,7 +148,7 @@ def unify_record(
         label_set.discard("UNKNOWN")
 
     # 获取文本内容并进行清洗
-    patent_name = row.get("﻿专利名称", "")
+    patent_name = row.get("专利名称", "")
     abstract = row.get("摘要文本", "")
     claims = row.get("主权项内容", "")
 
