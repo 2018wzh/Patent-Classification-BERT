@@ -36,50 +36,90 @@ class EvalResult:
         }
 
 
-def load_tokenized_jsonl(path: str, label_key: str = 'label') -> Dict[str, List[Any]]:
+def load_tokenized_file(path: str, label_key: str = 'label') -> Dict[str, List[Any]]:
+    """读取已分词数据，支持 .jsonl (逐行) 与 .json (列表) 两种格式。"""
     input_ids_list: List[List[int]] = []
     attention_list: List[List[int]] = []
     labels: List[int] = []
-    with open(path, 'r', encoding='utf-8') as f:
-        for line in f:
-            if not line.strip():
-                continue
-            obj = json.loads(line)
-            if 'input_ids' not in obj:
-                raise ValueError('already-tokenized 模式需要 input_ids 字段, 行缺失')
+    if path.endswith('.jsonl'):
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                obj = json.loads(line)
+                if 'input_ids' not in obj:
+                    raise ValueError('already-tokenized 模式需要 input_ids 字段, 行缺失')
+                input_ids_list.append(obj['input_ids'])
+                attention_list.append(obj.get('attention_mask') or [1]*len(obj['input_ids']))
+                lab_val = obj.get(label_key) if label_key in obj else obj.get('labels')
+                if isinstance(lab_val, bool):
+                    lab_val = 1 if lab_val else 0
+                if lab_val is None:
+                    lab_val = 0
+                labels.append(int(lab_val))
+    elif path.endswith('.json'):
+        with open(path, 'r', encoding='utf-8') as f:
+            root = json.load(f)
+        if not isinstance(root, list):
+            raise ValueError('tokenized json 顶层必须是列表')
+        for obj in root:
+            if not isinstance(obj, dict) or 'input_ids' not in obj:
+                raise ValueError('tokenized json 列表元素需包含 input_ids 字段')
             input_ids_list.append(obj['input_ids'])
             attention_list.append(obj.get('attention_mask') or [1]*len(obj['input_ids']))
             lab_val = obj.get(label_key) if label_key in obj else obj.get('labels')
             if isinstance(lab_val, bool):
                 lab_val = 1 if lab_val else 0
+            if lab_val is None:
+                lab_val = 0
             labels.append(int(lab_val))
-    return {
-        'input_ids': input_ids_list,
-        'attention_mask': attention_list,
-        'labels': labels,
-    }
+    else:
+        raise ValueError('只支持 .jsonl 或 .json 输入')
+    return {'input_ids': input_ids_list, 'attention_mask': attention_list, 'labels': labels}
 
 
-def load_text_jsonl(path: str, text_key: str = 'text', label_key: str = 'label') -> Dict[str, List[Any]]:
+def load_text_file(path: str, text_key: str = 'text', label_key: str = 'label') -> Dict[str, List[Any]]:
+    """读取原始文本数据 (.jsonl 或 .json 列表)。适配 preprocess 输出的 data_origin.json。"""
     texts: List[str] = []
     labels: List[int] = []
-    with open(path, 'r', encoding='utf-8') as f:
-        for line in f:
-            if not line.strip():
-                continue
-            obj = json.loads(line)
+    if path.endswith('.jsonl'):
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                obj = json.loads(line)
+                if not isinstance(obj, dict):
+                    raise ValueError('JSONL 每行需要 object')
+                text = obj.get(text_key)
+                if not text:
+                    continue
+                lab_val = obj.get(label_key)
+                if lab_val is None:
+                    raise ValueError('缺少 label 字段')
+                if isinstance(lab_val, bool):
+                    lab_val = 1 if lab_val else 0
+                texts.append(text)
+                labels.append(int(lab_val))
+    elif path.endswith('.json'):
+        with open(path, 'r', encoding='utf-8') as f:
+            root = json.load(f)
+        if not isinstance(root, list):
+            raise ValueError('json 顶层需为列表')
+        for obj in root:
             if not isinstance(obj, dict):
-                raise ValueError('JSONL 每行需要 object')
+                continue
             text = obj.get(text_key)
             if not text:
                 continue
             lab_val = obj.get(label_key)
             if lab_val is None:
-                raise ValueError('缺少 label 字段')
+                continue  # 跳过缺 label 记录
             if isinstance(lab_val, bool):
                 lab_val = 1 if lab_val else 0
             texts.append(text)
             labels.append(int(lab_val))
+    else:
+        raise ValueError('只支持 .jsonl 或 .json 输入')
     return {'texts': texts, 'labels': labels}
 
 
@@ -100,7 +140,7 @@ def gpu_env_diag():
 
 
 def evaluate(model_dir: str,
-             data_file: str,
+             input: str,
              batch_size: int,
              max_length: int,
              already_tokenized: bool,
@@ -114,14 +154,16 @@ def evaluate(model_dir: str,
     model.to(device)
     model.eval()
 
+    input_ids_list: List[List[int]] = []  # 为类型检查预先定义
+    attn_list: List[List[int]] = []
     if already_tokenized:
-        bundle = load_tokenized_jsonl(data_file, label_key=label_key)
+        bundle = load_tokenized_file(input, label_key=label_key)
         input_ids_list = bundle['input_ids']
         attn_list = bundle['attention_mask']
         labels = bundle['labels']
         texts = None
     else:
-        data = load_text_jsonl(data_file, text_key=text_key, label_key=label_key)
+        data = load_text_file(input, text_key=text_key, label_key=label_key)
         texts = data['texts']
         labels = data['labels']
 
@@ -176,15 +218,23 @@ def evaluate(model_dir: str,
 
     report = classification_report(labels_arr, preds_arr, target_names=[id2label.get(0,'0'), id2label.get(1,'1')], zero_division=0)
 
+    # 确保所有输出值为原生 Python 类型 (避免 numpy.int64/json 序列化报错)
+    metrics_dict = eval_res.to_dict()
+    metrics_dict = {k: (float(v) if isinstance(v, (float,)) else int(v) if isinstance(v, (bool, int)) else v) for k, v in metrics_dict.items()}
     out = {
-        'metrics': eval_res.to_dict(),
-        'confusion_matrix': {'tn': tn, 'fp': fp, 'fn': fn, 'tp': tp},
+        'metrics': metrics_dict,
+        'confusion_matrix': {
+            'tn': int(tn),
+            'fp': int(fp),
+            'fn': int(fn),
+            'tp': int(tp)
+        },
         'classification_report': report,
-        'samples': n,
-        'model': model_dir,
-        'data_file': data_file,
-        'already_tokenized': already_tokenized,
-        'max_length': max_length,
+        'samples': int(n),
+        'model': str(model_dir),
+        'input': str(input),
+        'already_tokenized': bool(already_tokenized),
+        'max_length': int(max_length),
     }
 
     if save_predictions:
@@ -204,12 +254,12 @@ def evaluate(model_dir: str,
 
 
 def main():
-    parser = argparse.ArgumentParser(description='评估脚本: 对标注 jsonl 运行推理并输出指标')
+    parser = argparse.ArgumentParser(description='评估脚本: 支持 jsonl (逐行) 与 json 列表 (data_origin.json)')
     parser.add_argument('--model', required=True, help='模型目录 (含 config.json, tokenizer)')
-    parser.add_argument('--data_file', required=True, help='标注数据 jsonl (tokenized 或 原始文本)')
-    parser.add_argument('--already-tokenized', action='store_true', help='数据为已分词 tokenized jsonl (含 input_ids)')
+    parser.add_argument('--input', required=True, help='标注数据 (.jsonl 或 .json 列表)')
+    parser.add_argument('--already-tokenized', action='store_true', help='输入为已分词 (含 input_ids/attention_mask) 的 jsonl/json')
     parser.add_argument('--text-key', default='text')
-    parser.add_argument('--label-key', default='label')
+    parser.add_argument('--label-key', default='valid')
     parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--max-length', type=int, default=512)
     parser.add_argument('--save-predictions', default=None, help='保存逐样本预测 jsonl')
@@ -224,8 +274,8 @@ def main():
     gpu_env_diag()
 
     res = evaluate(
-        model_dir=args.model_path,
-        data_file=args.data_file,
+        model_dir=args.model,
+        input=args.input,
         batch_size=args.batch_size,
         max_length=args.max_length,
         already_tokenized=args.already_tokenized,

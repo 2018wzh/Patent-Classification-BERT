@@ -7,9 +7,9 @@ import torch
 from transformers import BertTokenizer, BertForSequenceClassification
 
 
-def load_model(model_path: str, device, data_parallel: bool = False, freeze_encoder_layers: int = 0):
-    tokenizer = BertTokenizer.from_pretrained(model_path, use_fast=True)
-    model = BertForSequenceClassification.from_pretrained(model_path)
+def load_model(model: str, device, data_parallel: bool = False, freeze_encoder_layers: int = 0):
+    tokenizer = BertTokenizer.from_pretrained(model, use_fast=True)
+    model = BertForSequenceClassification.from_pretrained(model)
     model.to(device)
     if data_parallel and torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)

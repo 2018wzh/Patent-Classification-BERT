@@ -16,21 +16,21 @@ def gpu_env_diag():
             print(f"  GPU {i}: {torch.cuda.get_device_name(i)}  {props.total_memory/1024**3:.1f} GB")
     print("====================")
 
-def predict(texts: List[str], model_path: str, batch_size: int = 8):
+def predict(texts: List[str], model: str, batch_size: int = 8):
     """
     Performs inference on a list of texts.
 
     Args:
         texts (List[str]): A list of texts to classify.
-        model_path (str): Path to the trained model directory.
+        model (str): Path to the trained model directory.
         batch_size (int): Batch size for inference.
 
     Returns:
         A list of prediction dictionaries.
     """
     # 1. Load tokenizer and model
-    tokenizer = BertTokenizer.from_pretrained(model_path)
-    model = BertForSequenceClassification.from_pretrained(model_path)
+    tokenizer = BertTokenizer.from_pretrained(model)
+    model = BertForSequenceClassification.from_pretrained(model)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.eval()
@@ -111,7 +111,7 @@ def main():
             raise ValueError("Unsupported file format. Use .txt or .jsonl.")
 
     # Get predictions
-    predictions = predict(texts_to_predict, args.model_path, args.batch_size)
+    predictions = predict(texts_to_predict, args.model, args.batch_size)
 
     # Output results
     if args.output_file:

@@ -40,9 +40,9 @@ def gpu_env_diag():
     print("====================")
 
 
-def load_model(model_path: str, device, data_parallel: bool = False):
-    tokenizer = BertTokenizer.from_pretrained(model_path, use_fast=True)
-    model = BertForSequenceClassification.from_pretrained(model_path)
+def load_model(model: str, device, data_parallel: bool = False):
+    tokenizer = BertTokenizer.from_pretrained(model, use_fast=True)
+    model = BertForSequenceClassification.from_pretrained(model)
     model.to(device)
     if data_parallel and torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)
