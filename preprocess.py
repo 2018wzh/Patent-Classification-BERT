@@ -332,7 +332,7 @@ def main():
         tokenized_data: List[Dict[str, Any]] = []
         print("跳过分词 (--skip-tokenize)")
     else:
-        if args.only_valid:
+        if args.valid_only:
             print("分词目标: 仅 valid 记录 (--valid-only)")
             target_records = valid_records
         else:
@@ -347,8 +347,8 @@ def main():
     tokenized_output_file = os.path.join(output_dir, "tokenized_data.jsonl")
 
     # 写出原始: 若指定 --only-valid 则只输出 valid 记录
-    origin_to_dump = valid_records if args.only_valid else all_records
-    print(f"写出原始数据 ({'仅 valid' if args.only_valid else '全部记录'}): {raw_output_file}")
+    origin_to_dump = valid_records if args.valid_only else all_records
+    print(f"写出原始数据 ({'仅 valid' if args.valid_only else '全部记录'}): {raw_output_file}")
     with open(raw_output_file, 'w', encoding='utf-8') as f:
         json.dump(origin_to_dump, f, ensure_ascii=False, indent=2)
 
