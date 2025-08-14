@@ -299,10 +299,8 @@ def main():
                 setattr(self, k, v)
 
     args: Any = ConfigObject(train_cfg_dict)  # 简单处理，避免类型检查器属性报错
-    # 将 CLI resume 合并到 args; 若 config 中提供 resume_from_checkpoint 也保存
-    config_resume = train_cfg_dict.get('resume_from_checkpoint')  # 可能是具体路径, 'auto', True/False
-    setattr(args, 'resume_flag', bool(cli_args.resume) or (config_resume is True) or (config_resume == 'auto'))
-    setattr(args, 'resume_from_checkpoint', config_resume if isinstance(config_resume, str) and config_resume not in {'auto'} else None)
+    # 将 CLI resume/no-resume 合并到 args; 若 config 中提供 resume_from_checkpoint 也保存
+    setattr(args, 'cli_resume', bool(cli_args.resume))
     print(f"加载配置文件: {cli_args.config_file}")
     print(f"trainConfig 字段: {list(train_cfg_dict.keys())}")
 
@@ -609,38 +607,41 @@ def main():
         return os.path.join(out_dir, latest)
 
     resume_path = None
-    if getattr(args, 'resume_from_checkpoint', None):
-        if os.path.exists(args.resume_from_checkpoint):
-            resume_path = args.resume_from_checkpoint
-        else:
-            print(f"[resume] 指定的 resume_from_checkpoint 路径不存在: {args.resume_from_checkpoint}")
-    elif getattr(args, 'resume_flag', False):
-        # 自动发现
+    if args.cli_resume:
         resume_path = _discover_latest_ckpt(args.output_dir)
         if resume_path:
             print(f"[resume] 自动发现最新断点: {resume_path}")
         else:
-            print("[resume] 未发现 checkpoint-* 目录，将从头训练。")
-    else:
-        # 若未显式要求但 output_dir 中存在 checkpoint, 给出提示 (防止误覆盖)
-        potential = _discover_latest_ckpt(args.output_dir)
-        if potential:
-            print(f"[提示] 发现已有断点 {potential}. 如需续训请添加 --resume 或在 config 中设置 'resume_from_checkpoint': 'auto'")
+            print('[resume] 未发现可用断点，将从头训练。')
+
+    if resume_path:
+        state_file = os.path.join(resume_path, 'trainer_state.json')
+        try:
+            with open(state_file, 'r', encoding='utf-8') as sf:
+                state_obj = json.load(sf)
+            gs = state_obj.get('global_step')
+            ep = state_obj.get('epoch')
+            if gs is not None:
+                print(f"[resume] 上次 global_step={gs}")
+            if ep is not None:
+                print(f"[resume] 上次 epoch≈{ep:.4f}")
+        except Exception as e:
+            print(f"[resume] 读取断点状态失败: {e}")
     try:
-        train_result = trainer.train()
         if resume_path:
             print(f"[训练] 从断点继续: {resume_path}")
             train_result = trainer.train(resume_from_checkpoint=resume_path)
         else:
             train_result = trainer.train()
+        train_metrics = train_result.metrics
         trainer.save_model()
-        trainer.log_metrics("train", metrics)
-        trainer.save_metrics("train", metrics)
+        trainer.log_metrics("train", train_metrics)
+        trainer.save_metrics("train", train_metrics)
         trainer.save_state()
 
-        metrics = trainer.evaluate()
-        trainer.log_metrics("eval", metrics)
-        trainer.save_metrics("eval", metrics)
+        eval_metrics = trainer.evaluate()
+        trainer.log_metrics("eval", eval_metrics)
+        trainer.save_metrics("eval", eval_metrics)
     except RuntimeError as e:
         print(f"[训练RuntimeError] {e}")
         print("排查建议: \n"
