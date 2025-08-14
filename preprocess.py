@@ -32,7 +32,7 @@ def tokenize_and_format(records: List[Dict[str, Any]], train_config: Dict[str, A
 
     max_seq_length = train_config.get("max_seq_length", 512)
     text_column = train_config.get("text_column_name", "text")
-    label_column = train_config.get("label_column_name", "valid")
+    label_column = train_config.get("label_column_name", "label")
     batch_size = int(train_config.get("tokenize_batch_size", 512))
 
     print("\n--- 开始批量分词 (fast tokenizer, CPU) ---")
@@ -131,25 +131,9 @@ def clean_text_content(text: str, remove_keywords: List[str]) -> str:
 def unify_record(
     row: Dict[str, str], remove_keywords: Optional[List[str]] = None
 ) -> Dict[str, Any]:
-    # 标准化 IPC
-    all_ipc_raw = row.get("IPC分类号", "")
+    # 仅保留主分类号
     main_ipc_raw = row.get("IPC主分类号", "")
-    all_ipc_list = normalize_ipc_list(all_ipc_raw)
     main_ipc_norm = normalize_single_ipc(main_ipc_raw)
-
-    # 主标签
-    primary_label = derive_label(main_ipc_norm)
-    # 所有 IPC 转换为标签集合
-    label_set: Set[str] = set()
-    for code in all_ipc_list:
-        lbl = derive_label(code)
-        if lbl:
-            label_set.add(lbl)
-    if primary_label:
-        label_set.add(primary_label)
-    # 去除 UNKNOWN 以外空值，如只有 UNKNOWN 则保留
-    if "UNKNOWN" in label_set and len(label_set) > 1:
-        label_set.discard("UNKNOWN")
 
     # 获取文本内容并进行清洗
     patent_name = row.get("专利名称", "")
@@ -169,8 +153,8 @@ def unify_record(
     return {
         "id": grant_no,
         "text": text,
-        "labels": all_ipc_list,
-        "label": main_ipc_norm,
+        "ipc": main_ipc_norm,
+        # 后续匹配写入 label 与 valid
     }
 
 
@@ -210,9 +194,9 @@ def main():
     parser.add_argument('--valid-label', action='append', help='追加有效标签前缀 (可多次)')
     parser.add_argument('--output-dir', default='dataset', help='输出目录 (默认 dataset)')
     parser.add_argument('--skip-tokenize', action='store_true', help='仅解析与标注 valid, 不进行分词')
-    parser.add_argument('--valid-only', action='store_true', help='仅对 valid==True 的记录分词 (默认: 全部记录分词)')
+    # --valid-only 已弃用: 始终处理全部记录并保留 valid 标记供下游过滤
     parser.add_argument('--text-column-name', help='覆盖 trainConfig.text_column_name (默认 text)')
-    parser.add_argument('--label-column-name', help='覆盖 trainConfig.label_column_name (默认 valid)')
+    parser.add_argument('--label-column-name', help='覆盖 trainConfig.label_column_name (默认 label)')
     parser.add_argument('--verbose', action='store_true')
     args = parser.parse_args()
 
@@ -264,12 +248,6 @@ def main():
     else:
         print("未配置数据清洗关键字")
 
-    # 显式打印列名与标签前缀（确保未传参时来自 config）
-    effective_text_col = train_cfg.get('text_column_name', 'text')
-    effective_label_col = train_cfg.get('label_column_name', 'valid')
-    print(f"文本列(text_column_name): {effective_text_col}  标签列(label_column_name): {effective_label_col}")
-    print(f"有效标签前缀数量(validLabels): {len(preprocess_cfg.get('validLabels') or [])}")
-
     all_records: List[Dict[str, Any]] = []
     print(f"共需处理 {len(convert_files)} 个文件")
 
@@ -297,47 +275,38 @@ def main():
     print("\n=== 文件处理完成 ===")
     print(f"总共处理了 {len(all_records)} 条记录")
 
-    # 验证标签
-    print("\n--- 开始验证标签 ---")
+    # 主分类号匹配
+    print("\n--- 开始主分类号匹配 ---")
     cfg_valid = preprocess_cfg.get("validLabels") or []
-    cfg_valid_norm = sorted(set(normalize_single_ipc(v) for v in cfg_valid if v), key=lambda x: (-len(x), x))
-    print(f"有效标签前缀: {cfg_valid_norm}")
+    cfg_valid_norm = sorted({normalize_single_ipc(v) for v in cfg_valid if v}, key=lambda x: (-len(x), x))
+    print(f"有效前缀数量: {len(cfg_valid_norm)}")
 
-    def fuzzy_valid(codes: List[str]) -> bool:
-        for c in codes:
-            nc = normalize_single_ipc(c)
-            for pref in cfg_valid_norm:
-                if nc.startswith(pref):
-                    return True
-        return False
-
-    valid_records: List[Dict[str, Any]] = []
-    invalid_count = 0
-    for r in tqdm(all_records, desc="验证标签", unit="记录"):
-        val = fuzzy_valid(r.get("labels", []))
-        r["valid"] = val
-        if val:
-            valid_records.append(r)
-        else:
-            invalid_count += 1
-
-    valid_count = len(valid_records)
+    matched_count = 0
     total_count = len(all_records)
-    print("标签验证完成:")
-    print(f"  有效记录: {valid_count} ({(valid_count/total_count*100) if total_count else 0:.1f}%)")
-    print(f"  无效记录: {invalid_count} ({(invalid_count/total_count*100) if total_count else 0:.1f}%)")
+    for r in tqdm(all_records, desc="匹配", unit="记录"):
+        ipc_code = normalize_single_ipc(r.get("ipc", ""))
+        matched_prefix = ""
+        for pref in cfg_valid_norm:
+            if ipc_code.startswith(pref):
+                matched_prefix = pref
+                break
+        is_valid = bool(matched_prefix)
+        r["matched_prefix"] = matched_prefix  # 保存匹配到的前缀 (若无匹配为空串)
+        # 不再输出 valid 字段; 仅使用 label=1/0 表示有效性
+        r["label"] = 1 if is_valid else 0  # 数值标签 (二分类: 1=valid,0=invalid)
+        if is_valid:
+            matched_count += 1
+    print("匹配完成:")
+    print(f"  匹配成功: {matched_count} ({(matched_count/total_count*100) if total_count else 0:.1f}%)")
+    print(f"  未匹配: {total_count - matched_count} ({((total_count-matched_count)/total_count*100) if total_count else 0:.1f}%)")
 
     # 分词
     if args.skip_tokenize:
         tokenized_data: List[Dict[str, Any]] = []
         print("跳过分词 (--skip-tokenize)")
     else:
-        if args.valid_only:
-            print("分词目标: 仅 valid 记录 (--valid-only)")
-            target_records = valid_records
-        else:
-            print("分词目标: 全部记录 (包含 invalid, invalid 在标签列中为 0)")
-            target_records = all_records
+        print("分词目标: 全部记录 (label=1 或 0)")
+        target_records = all_records
         tokenized_data = tokenize_and_format(target_records, train_cfg)
 
     # 输出
@@ -347,8 +316,8 @@ def main():
     tokenized_output_file = os.path.join(output_dir, "tokenized_data.jsonl")
 
     # 写出原始: 若指定 --only-valid 则只输出 valid 记录
-    origin_to_dump = valid_records if args.valid_only else all_records
-    print(f"写出原始数据 ({'仅 valid' if args.valid_only else '全部记录'}): {raw_output_file}")
+    origin_to_dump = all_records
+    print(f"写出原始数据 (全部记录): {raw_output_file}")
     with open(raw_output_file, 'w', encoding='utf-8') as f:
         json.dump(origin_to_dump, f, ensure_ascii=False, indent=2)
 
@@ -362,7 +331,8 @@ def main():
 
     print("\n=== 处理完成 ===")
     print(f"总记录数: {total_count}")
-    print(f"有效记录: {valid_count}")
+    # 兼容旧输出字段名称, 使用 matched_count
+    print(f"匹配成功记录 (label=1): {matched_count}")
     if not args.skip_tokenize:
         print(f"分词样本数: {len(tokenized_data)}")
         print(f"分词后数据输出: {tokenized_output_file}")

@@ -468,7 +468,7 @@ def main():
                 path,
                 tokenizer=tokenizer,
                 text_column=getattr(args, 'text_column_name', 'text') if hasattr(args, 'text_column_name') else 'text',
-                label_column=getattr(args, 'label_column_name', 'valid') if hasattr(args, 'label_column_name') else 'valid',
+                label_column=getattr(args, 'label_column_name', 'label') if hasattr(args, 'label_column_name') else 'label',
                 max_seq_length=effective_seq_len,
             )
             print(f"[{split}] 加载数据 ({path}) size={len(ds)}")

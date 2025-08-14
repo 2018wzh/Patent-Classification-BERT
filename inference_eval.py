@@ -259,7 +259,7 @@ def main():
     parser.add_argument('--input', required=True, help='标注数据 (.jsonl 或 .json 列表)')
     parser.add_argument('--already-tokenized', action='store_true', help='输入为已分词 (含 input_ids/attention_mask) 的 jsonl/json')
     parser.add_argument('--text-key', default='text')
-    parser.add_argument('--label-key', default='valid')
+    parser.add_argument('--label-key', default='label')
     parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--max-length', type=int, default=512)
     parser.add_argument('--save-predictions', default=None, help='保存逐样本预测 jsonl')
