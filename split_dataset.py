@@ -48,40 +48,70 @@ def write_jsonl(path: str, records: List[Dict[str, Any]]):
             f.write(json.dumps(r, ensure_ascii=False) + '\n')
     print(f'完成写入: {path}')
 
+def stratified_split_balance_binary(records: List[Dict[str, Any]], ratios: Tuple[float, float, float], seed: int, label_key: str):
+    """对二分类数据进行类别平衡(下采样多数类) + 分层划分。
 
-def global_random_split(records: List[Dict[str, Any]], ratios: Tuple[float, float, float], seed: int):
+    步骤:
+      1. 将记录按 label_key (0/1 或 False/True) 分组。
+      2. 取两组的最小数量 min_count, 随机采样各 min_count 条形成平衡集合。
+      3. 对平衡集合按类别分别 shuffle 后按比例划分 (保证各 split 类别数量尽可能接近)。
+      4. 合并两个类别对应 split, 再整体 shuffle (保证交错)。
     """
-    在内存中进行全局随机划分，显示进度
-    """
-    train_ratio, val_ratio, test_ratio = ratios
-    print(f'\n--- 开始数据划分 ---')
-    print(f'划分比例: 训练集 {train_ratio:.1%}, 验证集 {val_ratio:.1%}, 测试集 {test_ratio:.1%}')
-    print(f'随机种子: {seed}')
-    
-    # 在内存中打乱数据
-    print('正在打乱数据顺序...')
     rng = random.Random(seed)
-    shuffled = records[:]
-    rng.shuffle(shuffled)
-    
-    # 计算划分点
-    n = len(shuffled)
-    n_train = int(round(n * train_ratio))
-    n_val = int(round(n * val_ratio))
-    n_test = n - n_train - n_val
-    
-    print(f'数据划分计划:')
-    print(f'  训练集: {n_train} 条 ({n_train/n:.1%})')
-    print(f'  验证集: {n_val} 条 ({n_val/n:.1%})')
-    print(f'  测试集: {n_test} 条 ({n_test/n:.1%})')
-    
-    # 在内存中进行划分
-    print('正在划分数据集...')
-    train = shuffled[:n_train]
-    val = shuffled[n_train:n_train + n_val]
-    test = shuffled[n_train + n_val:]
-    
-    print('数据划分完成')
+    group = {0: [], 1: []}
+    for r in records:
+        v = r.get(label_key, 0)
+        if isinstance(v, bool):
+            v = 1 if v else 0
+        try:
+            v = int(v)
+        except Exception:
+            v = 0
+        if v not in (0, 1):
+            v = 0
+        group[v].append(r)
+
+    n0, n1 = len(group[0]), len(group[1])
+
+    print(f"原始类别计数: class0={n0} class1={n1}  (ratio={n1/(n0+n1):.3f} 正例比例)")
+    min_count = min(n0, n1)
+    print(f"按较少类别数 {min_count} 下采样另一个类别以实现平衡。")
+    sampled0 = rng.sample(group[0], min_count) if n0 > min_count else group[0]
+    sampled1 = rng.sample(group[1], min_count) if n1 > min_count else group[1]
+
+    # 分层按比例划分
+    def split_one(lst: List[Dict[str, Any]]):
+        rng.shuffle(lst)
+        total = len(lst)
+        tr_n = int(round(total * ratios[0]))
+        val_n = int(round(total * ratios[1]))
+        # 余数给 test
+        test_n = total - tr_n - val_n
+        train_part = lst[:tr_n]
+        val_part = lst[tr_n:tr_n+val_n]
+        test_part = lst[tr_n+val_n:]
+        return train_part, val_part, test_part
+
+    t0, v0, te0 = split_one(sampled0)
+    t1, v1, te1 = split_one(sampled1)
+
+    train = t0 + t1
+    val = v0 + v1
+    test = te0 + te1
+    rng.shuffle(train)
+    rng.shuffle(val)
+    rng.shuffle(test)
+
+    def stats(name, part):
+        c0 = sum(1 for r in part if int(r.get(label_key,0)) == 0)
+        c1 = sum(1 for r in part if int(r.get(label_key,0)) == 1)
+        tot = len(part) or 1
+        print(f"  {name}: {len(part)} 条  class0={c0} class1={c1}  正例比例={c1/tot:.3f}")
+
+    print('[平衡+分层] 划分结果:')
+    stats('train', train)
+    stats('val', val)
+    stats('test', test)
     return train, val, test
 
 
@@ -149,8 +179,9 @@ def main():
         print('数据为空，退出')
         sys.exit(0)
 
-    print(f'\n--- 第2步: 划分数据 ---')
-    train, val, test = global_random_split(data, ratios_tuple, seed)
+    
+    print(f'\n--- 第2步: 平衡并分层划分 (二分类) ---')
+    train, val, test = stratified_split_balance_binary(data, ratios_tuple, seed, label_key)
 
     print(f'\n--- 第3步: 写入文件 ---')
     os.makedirs(outdir, exist_ok=True)
@@ -169,9 +200,8 @@ def main():
         compute_stats('test', test, label_key),
         {
             'total': len(data),
-            'mode': 'global_random',
             'seed': seed,
-            'ratios': list(ratios_tuple)
+            'ratios': list(ratios_tuple),
         }
     ]
     stats_file = os.path.join(outdir, 'split_stats.json')

@@ -165,17 +165,17 @@ python pack_dataset.py --inputs dataset/train.jsonl dataset/val.jsonl --out_dir 
 
 #### 单条文本预测
 ```bash
-python inference_clf.py --model_path ./outputs/bert-classification --text "要预测的专利文本内容"
+python inference_clf.py --model ./outputs/bert-classification --text "要预测的专利文本内容"
 ```
 
 #### 批量预测
 ```bash
 # 从文件批量预测
-python inference_clf.py --model_path ./outputs/bert-classification --input_file test_texts.txt --output_file predictions.jsonl
+python inference_clf.py --model ./outputs/bert-classification --input_file test_texts.txt --output_file predictions.jsonl
 ```
 
 #### 推理参数说明
-- `--model_path`: 训练好的模型路径
+- `--model`: 训练好的模型路径
 - `--text`: 单条文本输入
 - `--input_file`: 输入文件（.txt或.jsonl格式）
 - `--output_file`: 输出文件（可选）

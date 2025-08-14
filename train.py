@@ -17,36 +17,116 @@ from tqdm import tqdm
 
 
 class JsonlClassificationDataset(torch.utils.data.Dataset):
-    """读取预先分词(tokenized)好的 jsonl 文件，支持 memory / stream 策略与自动回退。
+    """读取预先分词(tokenized)好的数据文件，支持以下格式，并提供 memory / stream 策略与自动回退。
 
-    strategy:
+    支持的输入格式:
+      1) .jsonl 逐行 JSON（每行一个样本，典型的 tokenized_data.jsonl / train.jsonl 等）
+      2) .json  列表 JSON（例如 preprocess 输出的 data_origin.json，可能尚未分词）
+
+    若输入为未分词的 .json（列表），且对象中不存在 input_ids / attention_mask 字段，将尝试进行"即时分词"。
+    即时分词要求调用方在实例化前已加载或可提供 tokenizer；为保持最小侵入，本类支持传入 tokenizer 与 max_seq_length。
+
+    strategy (仅针对 .jsonl):
       - memory: 读取全部行到内存后解析 (速度快，需足够内存)
       - stream: 两遍文件扫描 (第一遍统计非空行数，第二遍解析)；内存占用低
     自动回退: memory 模式若发生 OSError 或 MemoryError，则回退到 stream。
     """
 
-    def __init__(self, path: str, show_progress: bool = True, strategy: str = "memory"):
+    def __init__(self,
+                 path: str,
+                 show_progress: bool = True,
+                 strategy: str = "memory",
+                 tokenizer: BertTokenizer | None = None,
+                 text_column: str = "text",
+                 label_column: str = "label",
+                 max_seq_length: int | None = None):
         if not os.path.exists(path):
             raise FileNotFoundError(f"找不到数据文件: {path}")
         self.path = path
         self.samples: List[Dict[str, Any]] = []
-        strategy = (strategy or "memory").lower()
-        if strategy not in {"memory", "stream"}:
-            print(f"[Dataset] 未知策略 {strategy} 使用 memory")
-            strategy = "memory"
-        try:
-            if strategy == "memory":
-                self._load_memory(show_progress)
-            else:
+        self._from_raw_text = False  # 标记是否进行了即时分词
+
+        ext = os.path.splitext(path)[1].lower()
+        if ext == '.jsonl':
+            strategy = (strategy or "memory").lower()
+            if strategy not in {"memory", "stream"}:
+                print(f"[Dataset] 未知策略 {strategy} 使用 memory")
+                strategy = "memory"
+            try:
+                if strategy == "memory":
+                    self._load_memory(show_progress)
+                else:
+                    self._load_stream(show_progress)
+            except (OSError, MemoryError) as e:
+                print(f"[Dataset] memory 策略失败: {e}. 回退 stream 模式。")
+                self.samples.clear()
                 self._load_stream(show_progress)
-        except (OSError, MemoryError) as e:
-            print(f"[Dataset] memory 策略失败: {e}. 回退 stream 模式。")
-            self.samples.clear()
-            self._load_stream(show_progress)
+        elif ext == '.json':
+            # 读取整体 JSON 列表
+            size_mb = os.path.getsize(self.path) / 1024 / 1024
+            print(f"[Dataset] 加载 JSON 列表 {self.path} ({size_mb:.2f} MB)")
+            with open(self.path, 'r', encoding='utf-8') as f:
+                root = json.load(f)
+            if not isinstance(root, list):
+                raise ValueError(f"JSON 文件 {self.path} 顶层不是列表，无法解析为样本集合。")
+            print(f"[Dataset] JSON 列表样本数: {len(root)}")
+            # 判断是否已分词
+            first = root[0] if root else {}
+            already_tokenized = all(k in first for k in ("input_ids", "attention_mask", label_column))
+            if not already_tokenized:
+                if tokenizer is None:
+                    raise ValueError("读取原始 JSON (未分词) 需要提供 tokenizer 参数。")
+                if max_seq_length is None:
+                    max_seq_length = 512
+                self._from_raw_text = True
+                texts: List[str] = []
+                labels: List[int] = []
+                for obj in root:
+                    text_val = obj.get(text_column, "")
+                    label_val = obj.get(label_column)
+                    if isinstance(label_val, bool):
+                        label_int = 1 if label_val else 0
+                    elif isinstance(label_val, int):
+                        label_int = int(label_val)
+                    else:
+                        # 对非 bool/int 的标签，若可解析为真值则置 1，否则 0
+                        label_int = 1 if label_val else 0
+                    texts.append(text_val)
+                    labels.append(label_int)
+                print(f"[Dataset] 即时分词 {len(texts)} 条样本 (max_seq_length={max_seq_length})")
+                batch_size = 256
+                for start in tqdm(range(0, len(texts), batch_size), desc="即时分词", unit="batch"):
+                    end = min(start + batch_size, len(texts))
+                    enc_batch = tokenizer(
+                        texts[start:end],
+                        padding=False,
+                        max_length=max_seq_length,
+                        truncation=True,
+                        add_special_tokens=True,
+                        return_attention_mask=True,
+                    )
+                    input_ids_list = list(enc_batch["input_ids"])  # type: ignore
+                    attn_list = list(enc_batch["attention_mask"])  # type: ignore
+                    for i, input_ids in enumerate(input_ids_list):
+                        self.samples.append({
+                            'input_ids': input_ids,
+                            'attention_mask': attn_list[i],
+                            'labels': labels[start + i],
+                        })
+                print(f"[Dataset] 即时分词完成，样本数={len(self.samples)}")
+            else:
+                for obj in root:
+                    self.samples.append(self._normalize(obj, label_key=label_column))
+        else:
+            raise ValueError(f"不支持的文件扩展名: {ext} (仅支持 .jsonl / .json)")
 
     # ====== 内部方法 ======
-    def _normalize(self, obj: Dict[str, Any]) -> Dict[str, Any]:
-        label_val = obj.get("label") if "label" in obj else obj.get("labels")
+    def _normalize(self, obj: Dict[str, Any], label_key: str | None = None) -> Dict[str, Any]:
+        # 兼容不同字段名：优先使用显式 label_key，其次 fallback 'label'/'labels'
+        if label_key and label_key in obj:
+            label_val = obj.get(label_key)
+        else:
+            label_val = obj.get("label") if "label" in obj else obj.get("labels")
         if isinstance(label_val, bool):
             label_val = 1 if label_val else 0
         return {
@@ -249,7 +329,6 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"使用设备: {device}")
 
-    strategy = args.dataset_strategy
     if device.type == "cuda":
         num_gpus = torch.cuda.device_count()
         print(f"可用GPU数量: {num_gpus}")
@@ -383,10 +462,19 @@ def main():
                 ds = PackedTensorDataset(packed_alt)
                 print(f"[{split}] 自动发现打包文件 {packed_alt} shape={tuple(ds.input_ids.shape)}")
                 return ds, True
-        # fallback jsonl
-        ds = JsonlClassificationDataset(path, strategy=strategy)
-        print(f"[{split}] 使用 jsonl ({path}) size={len(ds)} strategy={strategy}")
-        return ds, False
+        # 其余情况：可能是 .jsonl 或 .json (原始 / 已分词)
+        try:
+            ds = JsonlClassificationDataset(
+                path,
+                tokenizer=tokenizer,
+                text_column=getattr(args, 'text_column_name', 'text') if hasattr(args, 'text_column_name') else 'text',
+                label_column=getattr(args, 'label_column_name', 'valid') if hasattr(args, 'label_column_name') else 'valid',
+                max_seq_length=effective_seq_len,
+            )
+            print(f"[{split}] 加载数据 ({path}) size={len(ds)}")
+            return ds, False
+        except Exception as e:
+            raise RuntimeError(f"加载数据集失败 {path}: {e}")
 
     # 若 packConfig.enable 且未找到现成打包文件，可提示用户先执行 pack_dataset
     train_dataset, train_packed = pick_dataset(args.train_file, 'train')
