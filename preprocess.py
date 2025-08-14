@@ -264,6 +264,12 @@ def main():
     else:
         print("未配置数据清洗关键字")
 
+    # 显式打印列名与标签前缀（确保未传参时来自 config）
+    effective_text_col = train_cfg.get('text_column_name', 'text')
+    effective_label_col = train_cfg.get('label_column_name', 'valid')
+    print(f"文本列(text_column_name): {effective_text_col}  标签列(label_column_name): {effective_label_col}")
+    print(f"有效标签前缀数量(validLabels): {len(preprocess_cfg.get('validLabels') or [])}")
+
     all_records: List[Dict[str, Any]] = []
     print(f"共需处理 {len(convert_files)} 个文件")
 
