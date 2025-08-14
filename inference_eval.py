@@ -106,16 +106,12 @@ def evaluate(model_dir: str,
              already_tokenized: bool,
              text_key: str,
              label_key: str,
-             device_map: str = 'auto',
              save_predictions: str | None = None,
              ) -> Dict[str, Any]:
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     tokenizer = BertTokenizer.from_pretrained(model_dir, use_fast=True)
-    if device_map == 'auto':
-        model = BertForSequenceClassification.from_pretrained(model_dir, device_map='auto')
-    else:
-        model = BertForSequenceClassification.from_pretrained(model_dir)
-        model.to(device)
+    model = BertForSequenceClassification.from_pretrained(model_dir)
+    model.to(device)
     model.eval()
 
     if already_tokenized:
@@ -209,14 +205,13 @@ def evaluate(model_dir: str,
 
 def main():
     parser = argparse.ArgumentParser(description='评估脚本: 对标注 jsonl 运行推理并输出指标')
-    parser.add_argument('--model_path', required=True, help='模型目录 (含 config.json, tokenizer)')
+    parser.add_argument('--model', required=True, help='模型目录 (含 config.json, tokenizer)')
     parser.add_argument('--data_file', required=True, help='标注数据 jsonl (tokenized 或 原始文本)')
     parser.add_argument('--already-tokenized', action='store_true', help='数据为已分词 tokenized jsonl (含 input_ids)')
     parser.add_argument('--text-key', default='text')
     parser.add_argument('--label-key', default='label')
     parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--max-length', type=int, default=512)
-    parser.add_argument('--device-map', default='none', choices=['none','auto'])
     parser.add_argument('--save-predictions', default=None, help='保存逐样本预测 jsonl')
     parser.add_argument('--metrics-output', default=None, help='保存指标 json')
     parser.add_argument('--gpus', default=None, help='指定可见 GPU (如 "0" 或 "0,1")')
@@ -236,7 +231,6 @@ def main():
         already_tokenized=args.already_tokenized,
         text_key=args.text_key,
         label_key=args.label_key,
-        device_map=args.device_map,
         save_predictions=args.save_predictions,
     )
 

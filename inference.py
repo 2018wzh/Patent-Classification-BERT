@@ -7,15 +7,12 @@ import torch
 from transformers import BertTokenizer, BertForSequenceClassification
 
 
-def load_model(model_path: str, device, device_map: str = 'none', data_parallel: bool = False, freeze_encoder_layers: int = 0):
+def load_model(model_path: str, device, data_parallel: bool = False, freeze_encoder_layers: int = 0):
     tokenizer = BertTokenizer.from_pretrained(model_path, use_fast=True)
-    if device_map == 'auto':
-        model = BertForSequenceClassification.from_pretrained(model_path, device_map='auto')
-    else:
-        model = BertForSequenceClassification.from_pretrained(model_path)
-        model.to(device)
-        if data_parallel and torch.cuda.device_count() > 1:
-            model = torch.nn.DataParallel(model)
+    model = BertForSequenceClassification.from_pretrained(model_path)
+    model.to(device)
+    if data_parallel and torch.cuda.device_count() > 1:
+        model = torch.nn.DataParallel(model)
     if freeze_encoder_layers > 0:
         encoder = getattr(model, 'bert', None)
         if encoder is not None:
@@ -67,7 +64,6 @@ def main():
     parser.add_argument('--batch-size', type=int, default=8)
     parser.add_argument('--threshold', type=float, default=0.5, help='判定 valid 的概率阈值')
     parser.add_argument('--output', default=None, help='保存预测结果 (jsonl)')
-    parser.add_argument('--device-map', default='none', choices=['none','auto'], help='auto 使用 device_map 自动多 GPU 放置')
     parser.add_argument('--data-parallel', action='store_true', help='当 device-map=none 时用 DataParallel')
     parser.add_argument('--freeze-encoder-layers', type=int, default=0)
     parser.add_argument('--overflow-strategy', default='none', choices=['none','duplicate'], help='长文本拆分策略 (推理)')
@@ -85,7 +81,7 @@ def main():
     gpu_env_diag()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    tokenizer, model = load_model(args.model, device, args.device_map, args.data_parallel, args.freeze_encoder_layers)
+    tokenizer, model = load_model(args.model, device, args.data_parallel, args.freeze_encoder_layers)
 
     texts = []
     meta = []

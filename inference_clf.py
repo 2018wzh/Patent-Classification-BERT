@@ -76,7 +76,7 @@ def predict(texts: List[str], model_path: str, batch_size: int = 8):
 
 def main():
     parser = argparse.ArgumentParser(description="Inference script for sequence classification.")
-    parser.add_argument("--model_path", type=str, required=True, help="Path to the trained model directory.")
+    parser.add_argument("--model", type=str, required=True, help="Path to the trained model directory.")
     parser.add_argument("--text", type=str, help="A single text to classify.")
     parser.add_argument("--input_file", type=str, help="Path to an input file (txt or jsonl with a 'text' key).")
     parser.add_argument("--output_file", type=str, help="Path to save the output (jsonl).")
