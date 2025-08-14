@@ -1,7 +1,7 @@
 import os
 import json
 import argparse
-from typing import List, Dict, Any, Union
+from typing import List
 
 import torch
 from transformers import BertTokenizer, BertForSequenceClassification
@@ -46,6 +46,17 @@ def predict_texts(texts: List[str], tokenizer, model, max_length: int, batch_siz
     return results
 
 
+def gpu_env_diag():
+    print("=== 推理环境诊断 ===")
+    print(f"torch: {torch.__version__}  cuda_available={torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"GPU 数量: {torch.cuda.device_count()}")
+        for i in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(i)
+            print(f"  GPU {i}: {torch.cuda.get_device_name(i)}  {props.total_memory/1024**3:.1f} GB")
+    print("====================")
+
+
 def main():
     parser = argparse.ArgumentParser(description='Inference for valid classifier')
     parser.add_argument('--model', default='outputs/valid-clf', help='模型目录')
@@ -60,10 +71,18 @@ def main():
     parser.add_argument('--data-parallel', action='store_true', help='当 device-map=none 时用 DataParallel')
     parser.add_argument('--freeze-encoder-layers', type=int, default=0)
     parser.add_argument('--overflow-strategy', default='none', choices=['none','duplicate'], help='长文本拆分策略 (推理)')
+    parser.add_argument('--gpus', default=None, help='指定可见 GPU (如 "0" 或 "0,1")')
     args = parser.parse_args()
 
     if not args.text and not args.file:
         raise SystemExit('必须提供 --text 或 --file')
+
+    # 设置 GPU 可见性
+    if args.gpus:
+        os.environ['CUDA_VISIBLE_DEVICES'] = args.gpus
+        print(f"设置 CUDA_VISIBLE_DEVICES={args.gpus}")
+    os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
+    gpu_env_diag()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     tokenizer, model = load_model(args.model, device, args.device_map, args.data_parallel, args.freeze_encoder_layers)

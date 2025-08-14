@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import torch
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from transformers import BertTokenizer, BertForSequenceClassification
 from sklearn.metrics import precision_recall_fscore_support, confusion_matrix, classification_report
 
 
@@ -88,6 +88,17 @@ def batch_iter(seq_len: int, batch_size: int):
         yield i, min(i+batch_size, seq_len)
 
 
+def gpu_env_diag():
+    print("=== 推理环境诊断 ===")
+    print(f"torch: {torch.__version__}  cuda_available={torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"GPU 数量: {torch.cuda.device_count()}")
+        for i in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(i)
+            print(f"  GPU {i}: {torch.cuda.get_device_name(i)}  {props.total_memory/1024**3:.1f} GB")
+    print("====================")
+
+
 def evaluate(model_dir: str,
              data_file: str,
              batch_size: int,
@@ -99,11 +110,11 @@ def evaluate(model_dir: str,
              save_predictions: str | None = None,
              ) -> Dict[str, Any]:
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    tokenizer = AutoTokenizer.from_pretrained(model_dir, use_fast=True)
+    tokenizer = BertTokenizer.from_pretrained(model_dir, use_fast=True)
     if device_map == 'auto':
-        model = AutoModelForSequenceClassification.from_pretrained(model_dir, device_map='auto')
+        model = BertForSequenceClassification.from_pretrained(model_dir, device_map='auto')
     else:
-        model = AutoModelForSequenceClassification.from_pretrained(model_dir)
+        model = BertForSequenceClassification.from_pretrained(model_dir)
         model.to(device)
     model.eval()
 
@@ -208,7 +219,14 @@ def main():
     parser.add_argument('--device-map', default='none', choices=['none','auto'])
     parser.add_argument('--save-predictions', default=None, help='保存逐样本预测 jsonl')
     parser.add_argument('--metrics-output', default=None, help='保存指标 json')
+    parser.add_argument('--gpus', default=None, help='指定可见 GPU (如 "0" 或 "0,1")')
     args = parser.parse_args()
+
+    if args.gpus:
+        os.environ['CUDA_VISIBLE_DEVICES'] = args.gpus
+        print(f"设置 CUDA_VISIBLE_DEVICES={args.gpus}")
+    os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
+    gpu_env_diag()
 
     res = evaluate(
         model_dir=args.model_path,

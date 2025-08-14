@@ -1,8 +1,20 @@
 import argparse
 import json
+import os
 import torch
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from transformers import BertTokenizer, BertForSequenceClassification
 from typing import List
+
+
+def gpu_env_diag():
+    print("=== 推理环境诊断 ===")
+    print(f"torch: {torch.__version__}  cuda_available={torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"GPU 数量: {torch.cuda.device_count()}")
+        for i in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(i)
+            print(f"  GPU {i}: {torch.cuda.get_device_name(i)}  {props.total_memory/1024**3:.1f} GB")
+    print("====================")
 
 def predict(texts: List[str], model_path: str, batch_size: int = 8):
     """
@@ -17,8 +29,8 @@ def predict(texts: List[str], model_path: str, batch_size: int = 8):
         A list of prediction dictionaries.
     """
     # 1. Load tokenizer and model
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    model = AutoModelForSequenceClassification.from_pretrained(model_path)
+    tokenizer = BertTokenizer.from_pretrained(model_path)
+    model = BertForSequenceClassification.from_pretrained(model_path)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.eval()
@@ -69,11 +81,18 @@ def main():
     parser.add_argument("--input_file", type=str, help="Path to an input file (txt or jsonl with a 'text' key).")
     parser.add_argument("--output_file", type=str, help="Path to save the output (jsonl).")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size for inference.")
+    parser.add_argument('--gpus', default=None, help='指定可见 GPU (如 "0" 或 "0,1")')
     
     args = parser.parse_args()
 
     if not args.text and not args.input_file:
         raise ValueError("Either --text or --input_file must be provided.")
+
+    if args.gpus:
+        os.environ['CUDA_VISIBLE_DEVICES'] = args.gpus
+        print(f"设置 CUDA_VISIBLE_DEVICES={args.gpus}")
+    os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
+    gpu_env_diag()
 
     # Collect texts to predict
     texts_to_predict = []
