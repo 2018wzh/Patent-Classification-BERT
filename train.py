@@ -275,6 +275,11 @@ def main():
         default="config/config.json",
         help="配置文件路径 (包含 trainConfig 节点)",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="若输出目录存在 checkpoint-* 子目录，则自动从最新断点继续训练 (覆盖 config 中 resume_from_checkpoint=auto)",
+    )
     cli_args = parser.parse_args()
 
     # 从JSON文件加载配置，并取得 trainConfig 部分
@@ -294,6 +299,10 @@ def main():
                 setattr(self, k, v)
 
     args: Any = ConfigObject(train_cfg_dict)  # 简单处理，避免类型检查器属性报错
+    # 将 CLI resume 合并到 args; 若 config 中提供 resume_from_checkpoint 也保存
+    config_resume = train_cfg_dict.get('resume_from_checkpoint')  # 可能是具体路径, 'auto', True/False
+    setattr(args, 'resume_flag', bool(cli_args.resume) or (config_resume is True) or (config_resume == 'auto'))
+    setattr(args, 'resume_from_checkpoint', config_resume if isinstance(config_resume, str) and config_resume not in {'auto'} else None)
     print(f"加载配置文件: {cli_args.config_file}")
     print(f"trainConfig 字段: {list(train_cfg_dict.keys())}")
 
@@ -584,9 +593,46 @@ def main():
     )
 
     # 5. 训练 & 评估 - 加保护捕获潜在 core dump 前的 Python 异常线索
+    def _discover_latest_ckpt(out_dir: str):
+        if not os.path.isdir(out_dir):
+            return None
+        subdirs = [d for d in os.listdir(out_dir) if d.startswith('checkpoint-') and os.path.isdir(os.path.join(out_dir,d))]
+        if not subdirs:
+            return None
+        def _step(d):
+            try:
+                return int(d.split('-')[-1])
+            except Exception:
+                return -1
+        subdirs.sort(key=_step, reverse=True)
+        latest = subdirs[0]
+        return os.path.join(out_dir, latest)
+
+    resume_path = None
+    if getattr(args, 'resume_from_checkpoint', None):
+        if os.path.exists(args.resume_from_checkpoint):
+            resume_path = args.resume_from_checkpoint
+        else:
+            print(f"[resume] 指定的 resume_from_checkpoint 路径不存在: {args.resume_from_checkpoint}")
+    elif getattr(args, 'resume_flag', False):
+        # 自动发现
+        resume_path = _discover_latest_ckpt(args.output_dir)
+        if resume_path:
+            print(f"[resume] 自动发现最新断点: {resume_path}")
+        else:
+            print("[resume] 未发现 checkpoint-* 目录，将从头训练。")
+    else:
+        # 若未显式要求但 output_dir 中存在 checkpoint, 给出提示 (防止误覆盖)
+        potential = _discover_latest_ckpt(args.output_dir)
+        if potential:
+            print(f"[提示] 发现已有断点 {potential}. 如需续训请添加 --resume 或在 config 中设置 'resume_from_checkpoint': 'auto'")
     try:
         train_result = trainer.train()
-        metrics = train_result.metrics
+        if resume_path:
+            print(f"[训练] 从断点继续: {resume_path}")
+            train_result = trainer.train(resume_from_checkpoint=resume_path)
+        else:
+            train_result = trainer.train()
         trainer.save_model()
         trainer.log_metrics("train", metrics)
         trainer.save_metrics("train", metrics)
