@@ -8,3 +8,4 @@ model/*
 outputs/*
 logs/*
 config/*
+eval/*

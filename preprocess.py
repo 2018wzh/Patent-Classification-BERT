@@ -2,6 +2,7 @@ import csv
 import json
 import sys
 import os
+import argparse
 from typing import Dict, Any, List, Set, Optional
 from tqdm import tqdm
 from transformers import BertTokenizer
@@ -199,11 +200,23 @@ def process_csv_file(
 
 
 def main():
-    # 允许: python preprocess.py 或 python preprocess.py <config_path>
-    if len(sys.argv) > 2:
-        print("用法: python preprocess.py [config_path]")
-        sys.exit(1)
-    config_path = sys.argv[1] if len(sys.argv) == 2 else DEFAULT_CONFIG_PATH
+    parser = argparse.ArgumentParser(description="预处理脚本: CSV -> 规范 JSON + tokenized jsonl")
+    parser.add_argument('--config', default=DEFAULT_CONFIG_PATH, help='配置文件路径 (含 preprocessConfig/trainConfig)')
+    parser.add_argument('--convert-file', action='append', help='追加 / 覆盖要处理的 CSV 文件 (可多次指定)')
+    parser.add_argument('--model', help='覆盖 trainConfig.model')
+    parser.add_argument('--max-seq-length', type=int, help='覆盖 trainConfig.max_seq_length')
+    parser.add_argument('--tokenize-batch-size', type=int, help='覆盖 trainConfig.tokenize_batch_size')
+    parser.add_argument('--remove-keyword', action='append', help='追加要删除的噪声关键字 (可多次)')
+    parser.add_argument('--valid-label', action='append', help='追加有效标签前缀 (可多次)')
+    parser.add_argument('--output-dir', default='dataset', help='输出目录 (默认 dataset)')
+    parser.add_argument('--skip-tokenize', action='store_true', help='仅解析与标注 valid, 不进行分词')
+    parser.add_argument('--valid-only', action='store_true', help='仅对 valid==True 的记录分词 (默认: 全部记录分词)')
+    parser.add_argument('--text-column-name', help='覆盖 trainConfig.text_column_name (默认 text)')
+    parser.add_argument('--label-column-name', help='覆盖 trainConfig.label_column_name (默认 valid)')
+    parser.add_argument('--verbose', action='store_true')
+    args = parser.parse_args()
+
+    config_path = args.config
     if not os.path.exists(config_path):
         print(f"配置文件不存在: {config_path}")
         sys.exit(1)
@@ -216,40 +229,56 @@ def main():
     preprocess_cfg = full_cfg['preprocessConfig']
     train_cfg = full_cfg['trainConfig']
 
-    convert_files = preprocess_cfg.get("convertFiles", [])
+    # 覆盖 train_cfg 相关参数
+    if args.model:
+        train_cfg['model'] = args.model
+    if args.max_seq_length:
+        train_cfg['max_seq_length'] = args.max_seq_length
+    if args.tokenize_batch_size:
+        train_cfg['tokenize_batch_size'] = args.tokenize_batch_size
+    if args.text_column_name:
+        train_cfg['text_column_name'] = args.text_column_name
+    if args.label_column_name:
+        train_cfg['label_column_name'] = args.label_column_name
 
-    # 读取数据清洗配置
+    # convert files
+    convert_files = preprocess_cfg.get("convertFiles", [])
+    if args.convert_file:
+        # 若用户提供则使用提供的列表 (覆盖)
+        convert_files = args.convert_file
+    preprocess_cfg['convertFiles'] = convert_files
+
+    # remove keywords
     remove_keywords = preprocess_cfg.get("removeKeywords", [])
+    if args.remove_keyword:
+        remove_keywords = list(dict.fromkeys(remove_keywords + args.remove_keyword))
+        preprocess_cfg['removeKeywords'] = remove_keywords
+
+    # valid labels 追加
+    if args.valid_label:
+        added = [v for v in args.valid_label if v]
+        preprocess_cfg['validLabels'] = list(dict.fromkeys((preprocess_cfg.get('validLabels') or []) + added))
+
     if remove_keywords:
-        print(f"数据清洗配置: 将删除 {len(remove_keywords)} 个关键字")
-        print(f"关键字列表: {remove_keywords}")
+        print(f"数据清洗关键字数: {len(remove_keywords)}")
     else:
         print("未配置数据清洗关键字")
 
     all_records: List[Dict[str, Any]] = []
     print(f"共需处理 {len(convert_files)} 个文件")
 
-    # 逐个文件处理，每个文件完全读入内存后处理
+    # 逐个文件处理
     for i, rel in enumerate(convert_files, 1):
         print(f"\n--- 处理第 {i}/{len(convert_files)} 个文件 ---")
-
-        # 解析文件路径
         csv_path = (
-            rel
-            if os.path.isabs(rel)
-            else os.path.join(os.path.dirname(config_path), "..", rel).replace(
-                ".." + os.sep + os.sep, ".." + os.sep
-            )
+            rel if os.path.isabs(rel) else os.path.join(os.path.dirname(config_path), '..', rel)
         )
         if not os.path.exists(csv_path):
             csv_path = rel if os.path.isabs(rel) else os.path.join(os.getcwd(), rel)
         if not os.path.exists(csv_path):
             print(f"警告: 找不到文件 {rel}, 已跳过")
             continue
-
         print(f"文件路径: {csv_path}")
-
-        # 处理单个文件（完全读入内存）
         try:
             records = process_csv_file(csv_path, remove_keywords)
             print(f"成功处理 {len(records)} 条记录")
@@ -259,16 +288,13 @@ def main():
             print(f"错误: 处理文件 {csv_path} 时出错: {e}")
             continue
 
-    print(f"\n=== 文件处理完成 ===")
+    print("\n=== 文件处理完成 ===")
     print(f"总共处理了 {len(all_records)} 条记录")
 
-    # 批量验证所有记录的标签
-    print(f"\n--- 开始验证标签 ---")
-    # 仅使用配置的 validLabels 进行前缀模糊匹配
+    # 验证标签
+    print("\n--- 开始验证标签 ---")
     cfg_valid = preprocess_cfg.get("validLabels") or []
-    cfg_valid_norm = sorted(
-        set(normalize_single_ipc(v) for v in cfg_valid if v), key=lambda x: (-len(x), x)
-    )
+    cfg_valid_norm = sorted(set(normalize_single_ipc(v) for v in cfg_valid if v), key=lambda x: (-len(x), x))
     print(f"有效标签前缀: {cfg_valid_norm}")
 
     def fuzzy_valid(codes: List[str]) -> bool:
@@ -279,10 +305,8 @@ def main():
                     return True
         return False
 
-    # 批量验证标签（在内存中处理）
-    valid_records = []
+    valid_records: List[Dict[str, Any]] = []
     invalid_count = 0
-
     for r in tqdm(all_records, desc="验证标签", unit="记录"):
         val = fuzzy_valid(r.get("labels", []))
         r["valid"] = val
@@ -290,41 +314,53 @@ def main():
             valid_records.append(r)
         else:
             invalid_count += 1
-    
+
     valid_count = len(valid_records)
     total_count = len(all_records)
+    print("标签验证完成:")
+    print(f"  有效记录: {valid_count} ({(valid_count/total_count*100) if total_count else 0:.1f}%)")
+    print(f"  无效记录: {invalid_count} ({(invalid_count/total_count*100) if total_count else 0:.1f}%)")
 
-    print(f"标签验证完成:")
-    print(f"  有效记录: {valid_count} ({valid_count/total_count*100:.1f}%)")
-    print(f"  无效记录: {invalid_count} ({invalid_count/total_count*100:.1f}%)")
+    # 分词
+    if args.skip_tokenize:
+        tokenized_data: List[Dict[str, Any]] = []
+        print("跳过分词 (--skip-tokenize)")
+    else:
+        if args.only_valid:
+            print("分词目标: 仅 valid 记录 (--valid-only)")
+            target_records = valid_records
+        else:
+            print("分词目标: 全部记录 (包含 invalid, invalid 在标签列中为 0)")
+            target_records = all_records
+        tokenized_data = tokenize_and_format(target_records, train_cfg)
 
-
-    # 对验证通过的记录进行分词
-    tokenized_data = tokenize_and_format(valid_records, train_cfg)
-
-    # 写入输出文件
-    print(f"\n--- 写入输出文件 ---")
-    output_dir = os.path.join('dataset')
+    # 输出
+    output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
-    
-    # 保存原始的、带有valid标签的数据
     raw_output_file = os.path.join(output_dir, "data_origin.json")
-    print(f"正在写入带标签的原始数据: {raw_output_file}")
-    with open(raw_output_file, "w", encoding="utf-8") as f:
-        json.dump(all_records, f, ensure_ascii=False, indent=2)
-
-    # 保存分词后的数据为jsonl格式，便于datasets库加载
     tokenized_output_file = os.path.join(output_dir, "tokenized_data.jsonl")
-    print(f"正在写入分词后的数据: {tokenized_output_file}")
-    with open(tokenized_output_file, "w", encoding="utf-8") as f:
-        for record in tokenized_data:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-    print(f"\n=== 处理完成 ===")
+    # 写出原始: 若指定 --only-valid 则只输出 valid 记录
+    origin_to_dump = valid_records if args.only_valid else all_records
+    print(f"写出原始数据 ({'仅 valid' if args.only_valid else '全部记录'}): {raw_output_file}")
+    with open(raw_output_file, 'w', encoding='utf-8') as f:
+        json.dump(origin_to_dump, f, ensure_ascii=False, indent=2)
+
+    if not args.skip_tokenize:
+        print(f"写出分词数据: {tokenized_output_file}")
+        with open(tokenized_output_file, 'w', encoding='utf-8') as f:
+            for record in tokenized_data:
+                f.write(json.dumps(record, ensure_ascii=False) + '\n')
+    else:
+        print("未生成分词 jsonl (跳过)")
+
+    print("\n=== 处理完成 ===")
     print(f"总记录数: {total_count}")
-    print(f"有效记录 (已分词): {len(tokenized_data)}")
-    print(f"带标签的原始数据输出: {raw_output_file}")
-    print(f"分词后数据输出: {tokenized_output_file}")
+    print(f"有效记录: {valid_count}")
+    if not args.skip_tokenize:
+        print(f"分词样本数: {len(tokenized_data)}")
+        print(f"分词后数据输出: {tokenized_output_file}")
+    print(f"原始数据输出: {raw_output_file}")
 
 
 if __name__ == "__main__":
