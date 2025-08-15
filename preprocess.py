@@ -16,7 +16,9 @@ def load_config(path: str) -> Dict[str, Any]:
     return cfg
 
 
-def tokenize_and_format(records: List[Dict[str, Any]], train_config: Dict[str, Any]) -> List[Dict[str, Any]]:
+def tokenize_and_format(
+    records: List[Dict[str, Any]], train_config: Dict[str, Any]
+) -> List[Dict[str, Any]]:
     """批量高速分词 (CPU fast tokenizer)。
 
     使用 Rust 实现的 fast tokenizer 并分批处理，显著提升吞吐，避免逐条 Python 循环的开销。
@@ -36,7 +38,9 @@ def tokenize_and_format(records: List[Dict[str, Any]], train_config: Dict[str, A
     batch_size = int(train_config.get("tokenize_batch_size", 512))
 
     print("\n--- 开始批量分词 (fast tokenizer, CPU) ---")
-    print(f"模型/分词器: {model_name}  最大序列长度: {max_seq_length}  批次: {batch_size}")
+    print(
+        f"模型/分词器: {model_name}  最大序列长度: {max_seq_length}  批次: {batch_size}"
+    )
     tokenizer = BertTokenizer.from_pretrained(model_name, use_fast=True)
 
     texts = [rec[text_column] for rec in records]
@@ -56,24 +60,46 @@ def tokenize_and_format(records: List[Dict[str, Any]], train_config: Dict[str, A
             return_attention_mask=True,
         )
         for i, input_ids in enumerate(enc["input_ids"]):
-            out.append({
-                "input_ids": input_ids,
-                "attention_mask": enc["attention_mask"][i],
-                "label": labels[start + i],
-                "original_id": original_ids[start + i],
-            })
+            out.append(
+                {
+                    "input_ids": input_ids,
+                    "attention_mask": enc["attention_mask"][i],
+                    "label": labels[start + i],
+                    "original_id": original_ids[start + i],
+                }
+            )
     print(f"分词完成，总样本: {len(out)}")
     return out
 
+    # 全角转半角（字母和数字）
 
+
+def to_halfwidth(s: str) -> str:
+    res = []
+    for c in s:
+        codepoint = ord(c)
+        # 全角数字
+        if 0xFF10 <= codepoint <= 0xFF19:
+            res.append(chr(codepoint - 0xFF10 + ord("0")))
+        # 全角大写字母
+        elif 0xFF21 <= codepoint <= 0xFF3A:
+            res.append(chr(codepoint - 0xFF21 + ord("A")))
+        # 全角小写字母
+        elif 0xFF41 <= codepoint <= 0xFF5A:
+            res.append(chr(codepoint - 0xFF41 + ord("a")))
+        # 全角斜杠、减号等
+        elif c == "／":
+            res.append("/")
+        elif c in {"－", "–"}:
+            res.append("-")
+        else:
+            res.append(c)
+    return "".join(res)
 
 
 def normalize_single_ipc(code: str) -> str:
     if not code:
         return ""
-    code = code.strip().upper()
-    # 替换全角与奇异字符
-    code = code.replace("／", "/").replace("－", "-").replace("–", "-")
     # 去除内部多余空格
     code = code.replace(" ", "")
     # 去掉尾部的点
@@ -116,9 +142,9 @@ def clean_text_content(text: str, remove_keywords: List[str]) -> str:
     """
     根据配置的关键字清洗文本内容
     """
+    text = to_halfwidth(text)
     if not text or not remove_keywords:
         return text
-
     cleaned_text = text
     for keyword in remove_keywords:
         cleaned_text = cleaned_text.replace(keyword, "")
@@ -184,20 +210,46 @@ def process_csv_file(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="预处理脚本: CSV -> 规范 JSON + tokenized jsonl")
-    parser.add_argument('--config', default=DEFAULT_CONFIG_PATH, help='配置文件路径 (含 preprocessConfig/trainConfig)')
-    parser.add_argument('--convert-file', action='append', help='追加 / 覆盖要处理的 CSV 文件 (可多次指定)')
-    parser.add_argument('--model', help='覆盖 trainConfig.model')
-    parser.add_argument('--max-seq-length', type=int, help='覆盖 trainConfig.max_seq_length')
-    parser.add_argument('--tokenize-batch-size', type=int, help='覆盖 trainConfig.tokenize_batch_size')
-    parser.add_argument('--remove-keyword', action='append', help='追加要删除的噪声关键字 (可多次)')
-    parser.add_argument('--valid-label', action='append', help='追加有效标签前缀 (可多次)')
-    parser.add_argument('--output-dir', default='dataset', help='输出目录 (默认 dataset)')
-    parser.add_argument('--skip-tokenize', action='store_true', help='仅解析与标注 valid, 不进行分词')
+    parser = argparse.ArgumentParser(
+        description="预处理脚本: CSV -> 规范 JSON + tokenized jsonl"
+    )
+    parser.add_argument(
+        "--config",
+        default=DEFAULT_CONFIG_PATH,
+        help="配置文件路径 (含 preprocessConfig/trainConfig)",
+    )
+    parser.add_argument(
+        "--convert-file",
+        action="append",
+        help="追加 / 覆盖要处理的 CSV 文件 (可多次指定)",
+    )
+    parser.add_argument("--model", help="覆盖 trainConfig.model")
+    parser.add_argument(
+        "--max-seq-length", type=int, help="覆盖 trainConfig.max_seq_length"
+    )
+    parser.add_argument(
+        "--tokenize-batch-size", type=int, help="覆盖 trainConfig.tokenize_batch_size"
+    )
+    parser.add_argument(
+        "--remove-keyword", action="append", help="追加要删除的噪声关键字 (可多次)"
+    )
+    parser.add_argument(
+        "--valid-label", action="append", help="追加有效标签前缀 (可多次)"
+    )
+    parser.add_argument(
+        "--output-dir", default="dataset", help="输出目录 (默认 dataset)"
+    )
+    parser.add_argument(
+        "--skip-tokenize", action="store_true", help="仅解析与标注 valid, 不进行分词"
+    )
     # --valid-only 已弃用: 始终处理全部记录并保留 valid 标记供下游过滤
-    parser.add_argument('--text-column-name', help='覆盖 trainConfig.text_column_name (默认 text)')
-    parser.add_argument('--label-column-name', help='覆盖 trainConfig.label_column_name (默认 label)')
-    parser.add_argument('--verbose', action='store_true')
+    parser.add_argument(
+        "--text-column-name", help="覆盖 trainConfig.text_column_name (默认 text)"
+    )
+    parser.add_argument(
+        "--label-column-name", help="覆盖 trainConfig.label_column_name (默认 label)"
+    )
+    parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
     config_path = args.config
@@ -206,42 +258,44 @@ def main():
         sys.exit(1)
 
     full_cfg = load_config(config_path)
-    if 'preprocessConfig' not in full_cfg or 'trainConfig' not in full_cfg:
+    if "preprocessConfig" not in full_cfg or "trainConfig" not in full_cfg:
         print("配置文件需包含 'preprocessConfig' 与 'trainConfig' 两个节点。")
         sys.exit(1)
 
-    preprocess_cfg = full_cfg['preprocessConfig']
-    train_cfg = full_cfg['trainConfig']
+    preprocess_cfg = full_cfg["preprocessConfig"]
+    train_cfg = full_cfg["trainConfig"]
 
     # 覆盖 train_cfg 相关参数
     if args.model:
-        train_cfg['model'] = args.model
+        train_cfg["model"] = args.model
     if args.max_seq_length:
-        train_cfg['max_seq_length'] = args.max_seq_length
+        train_cfg["max_seq_length"] = args.max_seq_length
     if args.tokenize_batch_size:
-        train_cfg['tokenize_batch_size'] = args.tokenize_batch_size
+        train_cfg["tokenize_batch_size"] = args.tokenize_batch_size
     if args.text_column_name:
-        train_cfg['text_column_name'] = args.text_column_name
+        train_cfg["text_column_name"] = args.text_column_name
     if args.label_column_name:
-        train_cfg['label_column_name'] = args.label_column_name
+        train_cfg["label_column_name"] = args.label_column_name
 
     # convert files
     convert_files = preprocess_cfg.get("convertFiles", [])
     if args.convert_file:
         # 若用户提供则使用提供的列表 (覆盖)
         convert_files = args.convert_file
-    preprocess_cfg['convertFiles'] = convert_files
+    preprocess_cfg["convertFiles"] = convert_files
 
     # remove keywords
     remove_keywords = preprocess_cfg.get("removeKeywords", [])
     if args.remove_keyword:
         remove_keywords = list(dict.fromkeys(remove_keywords + args.remove_keyword))
-        preprocess_cfg['removeKeywords'] = remove_keywords
+        preprocess_cfg["removeKeywords"] = remove_keywords
 
     # valid labels 追加
     if args.valid_label:
         added = [v for v in args.valid_label if v]
-        preprocess_cfg['validLabels'] = list(dict.fromkeys((preprocess_cfg.get('validLabels') or []) + added))
+        preprocess_cfg["validLabels"] = list(
+            dict.fromkeys((preprocess_cfg.get("validLabels") or []) + added)
+        )
 
     if remove_keywords:
         print(f"数据清洗关键字数: {len(remove_keywords)}")
@@ -255,7 +309,9 @@ def main():
     for i, rel in enumerate(convert_files, 1):
         print(f"\n--- 处理第 {i}/{len(convert_files)} 个文件 ---")
         csv_path = (
-            rel if os.path.isabs(rel) else os.path.join(os.path.dirname(config_path), '..', rel)
+            rel
+            if os.path.isabs(rel)
+            else os.path.join(os.path.dirname(config_path), "..", rel)
         )
         if not os.path.exists(csv_path):
             csv_path = rel if os.path.isabs(rel) else os.path.join(os.getcwd(), rel)
@@ -278,7 +334,9 @@ def main():
     # 主分类号匹配
     print("\n--- 开始主分类号匹配 ---")
     cfg_valid = preprocess_cfg.get("validLabels") or []
-    cfg_valid_norm = sorted({normalize_single_ipc(v) for v in cfg_valid if v}, key=lambda x: (-len(x), x))
+    cfg_valid_norm = sorted(
+        {normalize_single_ipc(v) for v in cfg_valid if v}, key=lambda x: (-len(x), x)
+    )
     print(f"有效前缀数量: {len(cfg_valid_norm)}")
 
     matched_count = 0
@@ -297,8 +355,12 @@ def main():
         if is_valid:
             matched_count += 1
     print("匹配完成:")
-    print(f"  匹配成功: {matched_count} ({(matched_count/total_count*100) if total_count else 0:.1f}%)")
-    print(f"  未匹配: {total_count - matched_count} ({((total_count-matched_count)/total_count*100) if total_count else 0:.1f}%)")
+    print(
+        f"  匹配成功: {matched_count} ({(matched_count/total_count*100) if total_count else 0:.1f}%)"
+    )
+    print(
+        f"  未匹配: {total_count - matched_count} ({((total_count-matched_count)/total_count*100) if total_count else 0:.1f}%)"
+    )
 
     # 分词
     if args.skip_tokenize:
@@ -318,14 +380,14 @@ def main():
     # 写出原始: 若指定 --only-valid 则只输出 valid 记录
     origin_to_dump = all_records
     print(f"写出原始数据 (全部记录): {raw_output_file}")
-    with open(raw_output_file, 'w', encoding='utf-8') as f:
+    with open(raw_output_file, "w", encoding="utf-8") as f:
         json.dump(origin_to_dump, f, ensure_ascii=False, indent=2)
 
     if not args.skip_tokenize:
         print(f"写出分词数据: {tokenized_output_file}")
-        with open(tokenized_output_file, 'w', encoding='utf-8') as f:
+        with open(tokenized_output_file, "w", encoding="utf-8") as f:
             for record in tokenized_data:
-                f.write(json.dumps(record, ensure_ascii=False) + '\n')
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
     else:
         print("未生成分词 jsonl (跳过)")
 
