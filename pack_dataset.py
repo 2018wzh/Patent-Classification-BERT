@@ -20,6 +20,7 @@ import os, json
 from typing import List, Tuple
 import torch
 from tqdm import tqdm
+import numpy as np
 
 
 def read_jsonl(path: str):
@@ -66,7 +67,7 @@ def pack(samples, max_seq_length: int | None, pad_token_id: int):
     }
     return {'input_ids': input_ids, 'attention_mask': attention_mask, 'labels': labels, 'meta': meta}
 
-def process(input_path: str, output_path: str, max_seq_length: int | None, pad_token_id: int, overwrite: bool):
+def process(input_path: str, output_path: str, max_seq_length: int | None, pad_token_id: int, overwrite: bool, enable_memmap: bool):
     if (not overwrite) and os.path.exists(output_path):
         print(f"跳过已存在: {output_path}")
         return
@@ -76,6 +77,30 @@ def process(input_path: str, output_path: str, max_seq_length: int | None, pad_t
     bundle = pack(samples, max_seq_length, pad_token_id)
     torch.save(bundle, output_path)
     print(f"保存 {output_path}  meta={bundle['meta']}")
+    if enable_memmap:
+        base = output_path[:-3]  # 去掉 .pt
+        meta = bundle['meta']
+        N = meta['num_samples']
+        L = meta['max_seq_length']
+        # 以只读共享方式创建 .npy (一次写入) -> 训练中用 memmap 读取
+        ids_path = base + '.input_ids.npy'
+        attn_path = base + '.attention_mask.npy'
+        lab_path = base + '.labels.npy'
+        meta_path = base + '.memmap_meta.json'
+        if overwrite or (not os.path.exists(ids_path)):
+            np.save(ids_path, bundle['input_ids'].cpu().numpy())
+            np.save(attn_path, bundle['attention_mask'].cpu().numpy())
+            np.save(lab_path, bundle['labels'].cpu().numpy())
+            with open(meta_path, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'num_samples': int(N),
+                    'max_seq_length': int(L),
+                    'pad_token_id': int(pad_token_id),
+                    'dtype': 'int64'
+                }, f, ensure_ascii=False, indent=2)
+            print(f"[memmap] 生成: {ids_path}, {attn_path}, {lab_path}")
+        else:
+            print(f"[memmap] 跳过已存在 memmap 文件 (使用 --overwrite=true 覆盖)")
 
 def load_config(path: str = 'config/config.json'):
     if not os.path.exists(path):
@@ -94,6 +119,7 @@ def main():
     pad_id = pack_cfg.get('pad_token_id', 0)
     max_seq_len = pack_cfg.get('max_seq_length')  # 可能为 None
     overwrite = bool(pack_cfg.get('overwrite', False))
+    enable_memmap = bool(pack_cfg.get('memmap', False))
 
     candidates: List[Tuple[str, str]] = []
     def add_path(p: str | None):
@@ -121,9 +147,9 @@ def main():
         return
 
     print('=== 开始打包 ===')
-    print(f'suffix={suffix} pad_token_id={pad_id} max_seq_length={max_seq_len or "auto"} overwrite={overwrite}')
+    print(f'suffix={suffix} pad_token_id={pad_id} max_seq_length={max_seq_len or "auto"} overwrite={overwrite} memmap={enable_memmap}')
     for inp, outp in candidates:
-        process(inp, outp, max_seq_len, pad_id, overwrite)
+        process(inp, outp, max_seq_len, pad_id, overwrite, enable_memmap)
     print('=== 打包完成 ===')
 
 if __name__ == '__main__':

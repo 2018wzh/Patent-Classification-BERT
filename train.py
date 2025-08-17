@@ -458,14 +458,58 @@ def main():
                 'labels': self.labels[idx],
             }
 
+    class MemmapPackedDataset(torch.utils.data.Dataset):
+        """使用 pack_dataset 生成的 .npy memmap 文件实现只读共享，适合 torchrun 多进程。
+
+        需要存在 <base>_packed.input_ids.npy 等文件以及 .memmap_meta.json。
+        """
+        def __init__(self, base_pt: str):
+            import numpy as np
+            meta_path = base_pt[:-3] + '.memmap_meta.json'
+            if not os.path.exists(meta_path):
+                raise FileNotFoundError(meta_path)
+            with open(meta_path, 'r', encoding='utf-8') as f:
+                meta = json.load(f)
+            self.meta = meta
+            prefix = base_pt[:-3]
+            self._ids = np.load(prefix + '.input_ids.npy', mmap_mode='r')
+            self._attn = np.load(prefix + '.attention_mask.npy', mmap_mode='r')
+            self._labels = np.load(prefix + '.labels.npy', mmap_mode='r')
+            assert self._ids.shape[0] == self._labels.shape[0]
+        def __len__(self):
+            return self._ids.shape[0]
+        def __getitem__(self, idx):
+            import numpy as np
+            ids = torch.from_numpy(np.array(self._ids[idx], copy=False))
+            attn = torch.from_numpy(np.array(self._attn[idx], copy=False))
+            lab = torch.tensor(int(self._labels[idx]), dtype=torch.long)
+            return {'input_ids': ids, 'attention_mask': attn, 'labels': lab}
+
     def pick_dataset(path: str, split: str):
         if path.endswith('.pt') and os.path.exists(path):
+            # 优先 memmap
+            memmap_meta = path[:-3] + '.memmap_meta.json'
+            if os.path.exists(memmap_meta):
+                try:
+                    ds = MemmapPackedDataset(path)
+                    print(f"[{split}] 使用 memmap 打包数据: {path} shape={ds._ids.shape}")
+                    return ds, True
+                except Exception as e:
+                    print(f"[{split}] memmap 加载失败回退普通 pt: {e}")
             ds = PackedTensorDataset(path)
             print(f"[{split}] 直接加载打包数据: {path} shape={tuple(ds.input_ids.shape)}")
             return ds, True
         if path.endswith('.jsonl'):
             packed_alt = path[:-6] + '_packed.pt'
             if os.path.exists(packed_alt):
+                memmap_meta = packed_alt[:-3] + '.memmap_meta.json'
+                if os.path.exists(memmap_meta):
+                    try:
+                        ds = MemmapPackedDataset(packed_alt)
+                        print(f"[{split}] 自动发现 memmap 打包文件 {packed_alt} shape={ds._ids.shape}")
+                        return ds, True
+                    except Exception as e:
+                        print(f"[{split}] memmap 加载失败回退普通 pt: {e}")
                 ds = PackedTensorDataset(packed_alt)
                 print(f"[{split}] 自动发现打包文件 {packed_alt} shape={tuple(ds.input_ids.shape)}")
                 return ds, True
