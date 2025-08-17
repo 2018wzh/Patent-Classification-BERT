@@ -560,15 +560,25 @@ def main():
         model.config.max_position_embeddings = new_len
 
     if train_packed and eval_packed:
-        # 只有 PackedTensorDataset 才有 input_ids attribute
+        # 支持普通 .pt (input_ids) 与 memmap (_ids) 两种打包数据集
+        packed_seq_len = None
         if hasattr(train_dataset, 'input_ids'):
-            packed_seq_len = train_dataset.input_ids.size(1)  # type: ignore
+            try:
+                packed_seq_len = train_dataset.input_ids.size(1)  # type: ignore
+            except Exception:
+                packed_seq_len = None
+        elif hasattr(train_dataset, '_ids'):
+            try:
+                packed_seq_len = train_dataset._ids.shape[1]  # type: ignore
+            except Exception:
+                packed_seq_len = None
+        if packed_seq_len is not None:
             if packed_seq_len > model_max_pos:
                 _maybe_resize_position_embeddings(model, packed_seq_len)
                 effective_seq_len = packed_seq_len
-            print(f"使用打包张量数据集: 序列定长 {packed_seq_len} (有效长度={effective_seq_len}) 跳过动态 padding")
+            print(f"使用打包数据集: 序列定长 {packed_seq_len} (有效长度={effective_seq_len}) 跳过动态 padding")
         else:
-            print("[警告] 期望打包数据集具有 input_ids 张量, 但未找到, 仍继续训练。")
+            print("[警告] 未能获取打包数据集序列长度，仍继续训练，将关闭动态 padding (假定定长)")
         data_collator = None
     else:
         if effective_seq_len < model_max_pos:
