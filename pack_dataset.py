@@ -25,8 +25,10 @@ import numpy as np
 
 def read_jsonl(path: str):
     data = []
+    size = os.path.getsize(path)
+    print(f"[read] {path} ({size/1024/1024:.2f} MB)")
     with open(path, 'r', encoding='utf-8') as f:
-        for line in f:
+        for line in tqdm(f, desc=f"读取 {os.path.basename(path)}", unit='行'):
             line = line.strip()
             if not line:
                 continue
@@ -51,7 +53,7 @@ def pack(samples, max_seq_length: int | None, pad_token_id: int):
     attention_mask = torch.zeros((N, max_seq_length), dtype=torch.long)
     labels = torch.zeros((N,), dtype=torch.long)
     lengths = []
-    for i, s in enumerate(samples):
+    for i, s in enumerate(tqdm(samples, desc='填充打包', unit='样本')):
         ids = s['input_ids'][:max_seq_length]
         attn = s['attention_mask'][:max_seq_length]
         l = len(ids)
@@ -148,7 +150,7 @@ def main():
 
     print('=== 开始打包 ===')
     print(f'suffix={suffix} pad_token_id={pad_id} max_seq_length={max_seq_len or "auto"} overwrite={overwrite} memmap={enable_memmap}')
-    for inp, outp in candidates:
+    for inp, outp in tqdm(candidates, desc='文件打包', unit='文件'):
         process(inp, outp, max_seq_len, pad_id, overwrite, enable_memmap)
     print('=== 打包完成 ===')
 
