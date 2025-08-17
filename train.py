@@ -479,9 +479,10 @@ def main():
         def __len__(self):
             return self._ids.shape[0]
         def __getitem__(self, idx):
-            import numpy as np
-            ids = torch.from_numpy(np.array(self._ids[idx], copy=False))
-            attn = torch.from_numpy(np.array(self._attn[idx], copy=False))
+            # memmap 以只读方式打开 (mmap_mode='r'), 直接 from_numpy 会触发不可写警告
+            # 使用 torch.tensor(...) 触发复制，获得可写独立张量，避免 UserWarning 且不影响训练
+            ids = torch.tensor(self._ids[idx], dtype=torch.long)
+            attn = torch.tensor(self._attn[idx], dtype=torch.long)
             lab = torch.tensor(int(self._labels[idx]), dtype=torch.long)
             return {'input_ids': ids, 'attention_mask': attn, 'labels': lab}
 
