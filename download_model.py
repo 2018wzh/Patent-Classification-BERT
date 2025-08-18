@@ -25,7 +25,7 @@ def filter_existing(repo_files: List[str]):
 def main():
     parser = argparse.ArgumentParser(description='Download minimal subset of a HF model (safetensors + vocab)')
     parser.add_argument('--model', default='anferico/bert-for-patents', help='模型仓库名称')
-    parser.add_argument('--out', default='model', help='根输出目录 (会在其下创建模型名子目录)')
+    parser.add_argument('--out', default='models', help='根输出目录 (会在其下创建模型名子目录)')
     parser.add_argument('--revision', default=None, help='可选指定 revision/commit/tag')
     parser.add_argument('--force', action='store_true', help='已存在仍重新下载覆盖')
     args = parser.parse_args()
