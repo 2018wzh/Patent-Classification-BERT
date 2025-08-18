@@ -1,12 +1,24 @@
 import os
 import json
 import argparse
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 
 import torch
 from tqdm import tqdm
 from transformers import BertTokenizer, BertForSequenceClassification
+
+# 复用 preprocess 中的逻辑 (CSV -> 结构化 + 主分类号匹配)
+try:
+    from preprocess import (
+        load_config as pp_load_config,
+        process_csv_file as pp_process_csv_file,
+        normalize_single_ipc as pp_normalize_single_ipc,
+    )
+except Exception:
+    pp_load_config = None  # type: ignore
+    pp_process_csv_file = None  # type: ignore
+    pp_normalize_single_ipc = None  # type: ignore
 from sklearn.metrics import precision_recall_fscore_support, confusion_matrix, classification_report
 
 
@@ -140,32 +152,44 @@ def gpu_env_diag():
 
 
 def evaluate(model_dir: str,
-             input: str,
+             input: Optional[str],
              batch_size: int,
              max_length: int,
              already_tokenized: bool,
              text_key: str,
              label_key: str,
-             save_predictions: str | None = None,
+             save_predictions: Optional[str] = None,
+             in_memory_texts: Optional[List[str]] = None,
+             in_memory_labels: Optional[List[int]] = None,
              ) -> Dict[str, Any]:
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     tokenizer = BertTokenizer.from_pretrained(model_dir, use_fast=True)
     model = BertForSequenceClassification.from_pretrained(model_dir)
-    model.to(device)
+    # 赋值回 model 以兼容部分类型检查器
+    model = model.to(device)  # type: ignore
     model.eval()
 
     input_ids_list: List[List[int]] = []  # 为类型检查预先定义
     attn_list: List[List[int]] = []
-    if already_tokenized:
-        bundle = load_tokenized_file(input, label_key=label_key)
-        input_ids_list = bundle['input_ids']
-        attn_list = bundle['attention_mask']
-        labels = bundle['labels']
-        texts = None
+    if in_memory_texts is not None and in_memory_labels is not None:
+        # 内存模式 (例如来自 CSV 直接预处理)
+        if already_tokenized:
+            raise ValueError('内存模式暂不支持 already_tokenized=True')
+        texts = in_memory_texts
+        labels = in_memory_labels
     else:
-        data = load_text_file(input, text_key=text_key, label_key=label_key)
-        texts = data['texts']
-        labels = data['labels']
+        if input is None:
+            raise ValueError('未提供 input 路径或内存数据')
+        if already_tokenized:
+            bundle = load_tokenized_file(input, label_key=label_key)
+            input_ids_list = bundle['input_ids']
+            attn_list = bundle['attention_mask']
+            labels = bundle['labels']
+            texts = None
+        else:
+            data = load_text_file(input, text_key=text_key, label_key=label_key)
+            texts = data['texts']
+            labels = data['labels']
 
     n = len(labels)
     print(f'[加载] 样本数: {n}  已分词: {already_tokenized}')
@@ -232,7 +256,7 @@ def evaluate(model_dir: str,
         'classification_report': report,
         'samples': int(n),
         'model': str(model_dir),
-        'input': str(input),
+    'input': str(input) if input else 'in-memory',
         'already_tokenized': bool(already_tokenized),
         'max_length': int(max_length),
     }
@@ -254,9 +278,9 @@ def evaluate(model_dir: str,
 
 
 def main():
-    parser = argparse.ArgumentParser(description='评估脚本: 支持 jsonl (逐行) 与 json 列表 (data_origin.json)')
+    parser = argparse.ArgumentParser(description='评估脚本: 支持 jsonl/json 以及 csv (直接预处理内存推理)')
     parser.add_argument('--model', required=True, help='模型目录 (含 config.json, tokenizer)')
-    parser.add_argument('--input', required=True, help='标注数据 (.jsonl 或 .json 列表)')
+    parser.add_argument('--input', required=True, help='标注数据 (.jsonl/.json 或 .csv)')
     parser.add_argument('--already-tokenized', action='store_true', help='输入为已分词 (含 input_ids/attention_mask) 的 jsonl/json')
     parser.add_argument('--text-key', default='text')
     parser.add_argument('--label-key', default='label')
@@ -265,6 +289,7 @@ def main():
     parser.add_argument('--save-predictions', default=None, help='保存逐样本预测 jsonl')
     parser.add_argument('--metrics-output', default=None, help='保存指标 json')
     parser.add_argument('--gpus', default=None, help='指定可见 GPU (如 "0" 或 "0,1")')
+    parser.add_argument('--config', default='config/config.json', help='当输入为 CSV 时加载的配置文件 (含 preprocessConfig.validLabels/removeKeywords)')
     args = parser.parse_args()
 
     if args.gpus:
@@ -273,16 +298,61 @@ def main():
     os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
     gpu_env_diag()
 
-    res = evaluate(
-        model_dir=args.model,
-        input=args.input,
-        batch_size=args.batch_size,
-        max_length=args.max_length,
-        already_tokenized=args.already_tokenized,
-        text_key=args.text_key,
-        label_key=args.label_key,
-        save_predictions=args.save_predictions,
-    )
+    # CSV 模式: 读取 + 直接调用 preprocess 逻辑于内存中完成匹配
+    if args.input.lower().endswith('.csv'):
+        if pp_load_config is None or pp_process_csv_file is None or pp_normalize_single_ipc is None:
+            raise RuntimeError('无法导入 preprocess 中的函数，请确保 preprocess.py 存在且可导入')
+        if not os.path.exists(args.config):
+            raise FileNotFoundError(f'配置文件不存在: {args.config}')
+        cfg_all = pp_load_config(args.config)
+        if 'preprocessConfig' not in cfg_all:
+            raise ValueError('配置文件缺少 preprocessConfig 节点')
+        pp_cfg = cfg_all['preprocessConfig']
+        remove_keywords = pp_cfg.get('removeKeywords') or []
+        valid_labels_cfg = pp_cfg.get('validLabels') or []
+        print(f'[CSV] 读取并预处理: {args.input}')
+        records = pp_process_csv_file(args.input, remove_keywords)
+        print(f'[CSV] 原始记录数: {len(records)}  有效前缀候选: {len(valid_labels_cfg)}')
+        # 规范化前缀集合 (长优先)
+        valid_norm = sorted({pp_normalize_single_ipc(v) for v in valid_labels_cfg if v}, key=lambda x: (-len(x), x))
+        matched = 0
+        texts_mem: List[str] = []
+        labels_mem: List[int] = []
+        for r in records:
+            ipc_code = pp_normalize_single_ipc(r.get('ipc',''))
+            lab = 0
+            for pref in valid_norm:
+                if ipc_code.startswith(pref):
+                    lab = 1
+                    break
+            if lab == 1:
+                matched += 1
+            texts_mem.append(r.get('text',''))
+            labels_mem.append(lab)
+        print(f'[CSV] 匹配成功(label=1): {matched}  未匹配(label=0): {len(records)-matched}')
+        res = evaluate(
+            model_dir=args.model,
+            input=None,
+            batch_size=args.batch_size,
+            max_length=args.max_length,
+            already_tokenized=False,
+            text_key=args.text_key,
+            label_key=args.label_key,
+            save_predictions=args.save_predictions,
+            in_memory_texts=texts_mem,
+            in_memory_labels=labels_mem,
+        )
+    else:
+        res = evaluate(
+            model_dir=args.model,
+            input=args.input,
+            batch_size=args.batch_size,
+            max_length=args.max_length,
+            already_tokenized=args.already_tokenized,
+            text_key=args.text_key,
+            label_key=args.label_key,
+            save_predictions=args.save_predictions,
+        )
 
     metrics_json = json.dumps(res, ensure_ascii=False, indent=2)
     if args.metrics_output:
