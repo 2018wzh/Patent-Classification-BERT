@@ -25,12 +25,16 @@ def filter_existing(repo_files: List[str]):
 def main():
     parser = argparse.ArgumentParser(description='Download minimal subset of a HF model (safetensors + vocab)')
     parser.add_argument('--model', default='anferico/bert-for-patents', help='模型仓库名称')
-    parser.add_argument('--out', default='model', help='输出目录')
+    parser.add_argument('--out', default='model', help='根输出目录 (会在其下创建模型名子目录)')
     parser.add_argument('--revision', default=None, help='可选指定 revision/commit/tag')
     parser.add_argument('--force', action='store_true', help='已存在仍重新下载覆盖')
     args = parser.parse_args()
 
-    os.makedirs(args.out, exist_ok=True)
+    # 解析模型名子目录 (取 repo 最后段，如 anferico/bert-for-patents -> bert-for-patents)
+    model_id = args.model.rstrip('/')
+    model_subdir_name = model_id.split('/')[-1]
+    final_out_dir = os.path.join(args.out, model_subdir_name)
+    os.makedirs(final_out_dir, exist_ok=True)
 
     print(f'[INFO] 列出远端文件: {args.model} ...')
     repo_files = list_repo_files(args.model, revision=args.revision)  # 需要 huggingface_hub >=0.17
@@ -40,12 +44,12 @@ def main():
     if 'vocab.txt' not in selected:
         print('[WARN] 未找到 vocab.txt，可能该模型使用不同 tokenizer。')
 
-    print('[INFO] 将下载以下文件:')
+    print('[INFO] 将下载以下文件到子目录:', final_out_dir)
     for f in selected:
         print('  -', f)
 
     for fname in selected:
-        target_path = os.path.join(args.out, fname)
+        target_path = os.path.join(final_out_dir, fname)
         if os.path.exists(target_path) and not args.force:
             print(f'[SKIP] {fname} 已存在 (使用 --force 覆盖)')
             continue
@@ -54,15 +58,15 @@ def main():
             repo_id=args.model,
             filename=fname,
             revision=args.revision,
-            local_dir=args.out,
+            local_dir=final_out_dir,
             local_dir_use_symlinks=False,
             force_download=args.force
         )
         if local_file != target_path:
-            # hf_hub_download 可能带子目录；确保移动或复制 (通常已在 out 内)
+            # hf_hub_download 可能带子目录；通常已在 final_out_dir 内，无需额外操作
             pass
-    print('[DONE] 下载完成，文件保存在:', os.path.abspath(args.out))
-    print('可在 train.py 中使用 --model', args.out)
+    print('[DONE] 下载完成，文件保存在:', os.path.abspath(final_out_dir))
+    print('训练可使用 --model', final_out_dir)
 
 
 if __name__ == '__main__':
