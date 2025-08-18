@@ -3,6 +3,7 @@ import json
 import sys
 import os
 import argparse
+import glob
 from typing import Dict, Any, List, Set, Optional
 from tqdm import tqdm
 from transformers import BertTokenizer
@@ -305,19 +306,78 @@ def main():
     all_records: List[Dict[str, Any]] = []
     print(f"共需处理 {len(convert_files)} 个文件")
 
-    # 逐个文件处理
-    for i, rel in enumerate(convert_files, 1):
-        print(f"\n--- 处理第 {i}/{len(convert_files)} 个文件 ---")
-        csv_path = (
-            rel
-            if os.path.isabs(rel)
-            else os.path.join(os.path.dirname(config_path), "..", rel)
-        )
-        if not os.path.exists(csv_path):
-            csv_path = rel if os.path.isabs(rel) else os.path.join(os.getcwd(), rel)
-        if not os.path.exists(csv_path):
-            print(f"警告: 找不到文件 {rel}, 已跳过")
-            continue
+    # ---- 通配符扩展 (支持 *, ?, [], ** ) ----
+    expanded_list: List[str] = []
+    seen_paths: Set[str] = set()
+    base_dir_config_parent = os.path.abspath(os.path.join(os.path.dirname(config_path), ".."))
+    cwd = os.getcwd()
+
+    def try_expand(pattern: str) -> List[str]:
+        candidates: List[str] = []
+        search_patterns = []
+        if os.path.isabs(pattern):
+            search_patterns.append(pattern)
+        else:
+            # 相对 config 上级目录
+            search_patterns.append(os.path.join(base_dir_config_parent, pattern))
+            # 相对当前工作目录
+            search_patterns.append(os.path.join(cwd, pattern))
+            # 原样 (以防 pattern 自带子路径引用)
+            search_patterns.append(pattern)
+        matched: List[str] = []
+        for sp in search_patterns:
+            g = glob.glob(sp, recursive=True)
+            if g:
+                matched.extend(g)
+        # 去重并仅保留文件
+        uniq: List[str] = []
+        seen_local: Set[str] = set()
+        for m in matched:
+            if os.path.isfile(m):
+                ap = os.path.abspath(m)
+                if ap not in seen_local:
+                    seen_local.add(ap)
+                    uniq.append(ap)
+        return uniq
+
+    wildcard_chars = set('*?[]')
+    for item in convert_files:
+        if any(ch in item for ch in wildcard_chars):
+            expanded = try_expand(item)
+            if not expanded:
+                print(f"通配符未匹配到文件: {item}")
+                continue
+            print(f"通配符扩展: {item} -> {len(expanded)} 个文件")
+            for p in expanded:
+                if p not in seen_paths:
+                    seen_paths.add(p)
+                    expanded_list.append(p)
+        else:
+            # 非通配符按原逻辑解析路径
+            candidate_paths = []
+            if os.path.isabs(item):
+                candidate_paths.append(item)
+            else:
+                candidate_paths.append(os.path.join(base_dir_config_parent, item))
+                candidate_paths.append(os.path.join(cwd, item))
+                candidate_paths.append(item)
+            final_path = None
+            for cp in candidate_paths:
+                if os.path.exists(cp) and os.path.isfile(cp):
+                    final_path = os.path.abspath(cp)
+                    break
+            if final_path is None:
+                print(f"警告: 找不到文件 {item}, 已跳过")
+                continue
+            if final_path not in seen_paths:
+                seen_paths.add(final_path)
+                expanded_list.append(final_path)
+
+    print(f"通配符展开后文件总数: {len(expanded_list)}")
+
+    # 逐个文件处理 (使用展开后的列表)
+    for i, csv_path in enumerate(expanded_list, 1):
+        print(f"\n--- 处理第 {i}/{len(expanded_list)} 个文件 ---")
         print(f"文件路径: {csv_path}")
         try:
             records = process_csv_file(csv_path, remove_keywords)
