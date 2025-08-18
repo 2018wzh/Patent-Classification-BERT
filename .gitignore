@@ -3,7 +3,7 @@ __pycache__/**
 *.py[cod]
 .vscode/**
 dataset/**
-model/*
+models/*
 .venv
 outputs/*
 logs/*
