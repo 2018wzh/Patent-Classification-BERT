@@ -480,7 +480,7 @@ def main():
         print("分词目标: 全部记录 (label=1 或 0)")
         target_records = all_records
         batch_size = preprocess_cfg.get("batchSize", 512)
-        tokenized_data = tokenize_and_format(target_records, train_cfg, batch_size)
+        tokenized_data = tokenize_and_format(target_records, train_cfg, preprocess_cfg)
 
     # 输出
     output_dir = args.output_dir
