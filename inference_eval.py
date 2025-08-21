@@ -347,9 +347,9 @@ def main():
     parser.add_argument('--gpus', default=None, help='指定可见 GPU (如 "0" 或 "0,1")')
     parser.add_argument('--config', default='config/config.json', help='当输入为 CSV 时加载的配置文件 (含 preprocess_config.valid_labels/remove_keywords)')
     parser.add_argument('--ipc-key', default='ipc', help='IPC 字段名称 (用于统计)')
-    parser.add_argument('--ipc-top-k', type=int, default=100, help='IPC 汇总中前K名 (比例/数量)')
+    parser.add_argument('--ipc-top-k', type=int, default=10, help='IPC 汇总中前K名 (比例/数量)')
     parser.add_argument('--ipc-min-total', type=int, default=1, help='计算最高占比/前K占比列表时的最小样本数过滤 (默认不过滤)')
-    parser.add_argument('--ipc-summary-text', default=None, help='可选: 将 IPC 汇总指标写出为纯文本文件 (类似示例)')
+    parser.add_argument('--ipc-summary-text', default="outputs/ipc_summary.txt", help='将 IPC 汇总指标写出为纯文本文件')
     args = parser.parse_args()
 
     if args.gpus:
