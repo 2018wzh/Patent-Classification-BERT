@@ -517,12 +517,9 @@ def main():
                 print(f"[警告] 写入 IPC 文本汇总失败: {e}")
 
     metrics_json = json.dumps(res, ensure_ascii=False, indent=2)
-    if args.metrics_output:
-        with open(args.metrics_output, 'w', encoding='utf-8') as f:
-            f.write(metrics_json)
-        print(f'[输出] 指标写入 {args.metrics_output}')
-    else:
-        print(metrics_json)
+    with open(args.metrics_output, 'w', encoding='utf-8') as f:
+        f.write(metrics_json)
+    print(f'[输出] 指标写入 {args.metrics_output}')
 
 
 if __name__ == '__main__':
