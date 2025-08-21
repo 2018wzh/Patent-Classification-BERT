@@ -22,14 +22,6 @@ def load_config(path: str) -> Dict[str, Any]:
 def tokenize_and_format(
     records: List[Dict[str, Any]], train_config: Dict[str, Any], preprocess_config: Dict[str, Any]
 ) -> List[Dict[str, Any]]:
-    """批量高速分词 (CPU fast tokenizer)。
-
-    使用 Rust 实现的 fast tokenizer 并分批处理，显著提升吞吐，避免逐条 Python 循环的开销。
-    GPU 对 WordPiece/BPE 分词无显著收益；真正加速方式是批量 + fast tokenizer。
-
-    额外可配置项 (train_config):
-      - batch_size: 每批文本数量 (默认 512)
-    """
     model_name = train_config.get("model")
     if not model_name:
         print("错误: 训练配置中缺少 'model' 名称。")
@@ -55,8 +47,9 @@ def tokenize_and_format(
     out: List[Dict[str, Any]] = []
 
     if workers == 1:
-        # 单线程原逻辑
-        for start in tqdm(range(0, total, batch_size), desc="分词", unit="batch"):
+        # 单线程: 使用样本级进度条
+        pbar = tqdm(total=total, desc="分词", unit="样本")
+        for start in range(0, total, batch_size):
             end = min(start + batch_size, total)
             batch_texts = texts[start:end]
             enc = tokenizer(
@@ -76,6 +69,8 @@ def tokenize_and_format(
                         "original_id": original_ids[start + i],
                     }
                 )
+            pbar.update(end - start)
+        pbar.close()
     else:
         # 多线程：以 batch 为单位并行，将结果按 start 排序后合并
         batch_starts = list(range(0, total, batch_size))
@@ -96,11 +91,12 @@ def tokenize_and_format(
         with ThreadPoolExecutor(max_workers=workers) as ex:
             for s in batch_starts:
                 futures.append(ex.submit(encode_range, s))
-            pbar = tqdm(total=len(batch_starts), desc="分词(多线程)", unit="batch")
+            pbar = tqdm(total=total, desc="分词(多线程)", unit="样本")
             for fut in as_completed(futures):
                 start, enc = fut.result()
                 results.append((start, enc))
-                pbar.update(1)
+                end = min(start + batch_size, total)
+                pbar.update(end - start)
             pbar.close()
         # 按 start 排序，保证稳定顺序
         results.sort(key=lambda x: x[0])
