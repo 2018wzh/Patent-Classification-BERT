@@ -18,7 +18,7 @@ def load_config(path: str) -> Dict[str, Any]:
 
 
 def tokenize_and_format(
-    records: List[Dict[str, Any]], train_config: Dict[str, Any]
+    records: List[Dict[str, Any]], train_config: Dict[str, Any], batch_size: int
 ) -> List[Dict[str, Any]]:
     """批量高速分词 (CPU fast tokenizer)。
 
@@ -26,7 +26,7 @@ def tokenize_and_format(
     GPU 对 WordPiece/BPE 分词无显著收益；真正加速方式是批量 + fast tokenizer。
 
     额外可配置项 (train_config):
-      - tokenize_batch_size: 每批文本数量 (默认 512)
+      - batch_size: 每批文本数量 (默认 512)
     """
     model_name = train_config.get("model")
     if not model_name:
@@ -36,7 +36,6 @@ def tokenize_and_format(
     max_seq_length = train_config.get("max_seq_length", 512)
     text_column = train_config.get("text_column_name", "text")
     label_column = train_config.get("label_column_name", "label")
-    batch_size = int(train_config.get("tokenize_batch_size", 512))
 
     print("\n--- 开始批量分词 (fast tokenizer, CPU) ---")
     print(
@@ -429,7 +428,8 @@ def main():
     else:
         print("分词目标: 全部记录 (label=1 或 0)")
         target_records = all_records
-        tokenized_data = tokenize_and_format(target_records, train_cfg)
+        batch_size = preprocess_cfg.get("batchSize", 512)
+        tokenized_data = tokenize_and_format(target_records, train_cfg, batch_size)
 
     # 输出
     output_dir = args.output_dir
