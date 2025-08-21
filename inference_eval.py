@@ -419,73 +419,103 @@ def main():
             ipc_key=args.ipc_key,
         )
 
-    # 基于已存在的 ipc_stats 生成汇总 (若存在)
+    # 基于已存在的 ipc_stats 生成汇总 (若存在) -- 添加预测 vs 真实双版本对比
     ipc_stats = res.get('ipc_stats') or []
     if ipc_stats:
         top_k = max(1, args.ipc_top_k)
         min_total = max(1, args.ipc_min_total)
-        # 重新构建统计以确保有 pos/total 信息
-        # ipc_stats 中已含: ipc,total,label_pos
-        # 正例数=label_pos, 占比=label_pos/total
-        enriched = []
+        enriched_pred = []  # (ipc,total,pred_pos,ratio_pred)
+        enriched_label = []  # (ipc,total,label_pos,ratio_label)
         for row in ipc_stats:
             total = int(row.get('total',0))
-            pos = int(row.get('label_pos',0))
             if total <= 0:
                 continue
-            ratio = pos/total if total else 0.0
-            enriched.append((row.get('ipc',''), total, pos, ratio))
-        distinct_count = len(enriched)
-        total_samples = sum(t for _,t,_,_ in enriched)
-        total_positive = sum(p for _,_,p,_ in enriched)
-        overall_ratio = total_positive/total_samples if total_samples else 0.0
-        # 过滤后用于比例 TopK
-        filtered_for_ratio = [e for e in enriched if e[1] >= min_total]
-        if filtered_for_ratio:
-            max_ratio_entry = max(filtered_for_ratio, key=lambda x: (x[3], x[1]))
-        else:
-            max_ratio_entry = None
-        # 比例排序
-        top_ratio = sorted(filtered_for_ratio, key=lambda x: (-x[3], -x[1], x[0]))[:top_k]
-        # 数量排序 (不必过滤)
-        top_count = sorted(enriched, key=lambda x: (-x[1], -x[3], x[0]))[:top_k]
+            pred_pos = int(row.get('pred_pos',0))
+            label_pos = int(row.get('label_pos',0))
+            enriched_pred.append((row.get('ipc',''), total, pred_pos, pred_pos/total if total else 0.0))
+            enriched_label.append((row.get('ipc',''), total, label_pos, label_pos/total if total else 0.0))
+
+        distinct_count = len(enriched_pred)
+        total_samples = sum(t for _,t,_,_ in enriched_pred)
+        total_positive_pred = sum(p for _,_,p,_ in enriched_pred)
+        total_positive_label = sum(p for _,_,p,_ in enriched_label)
+        overall_ratio_pred = total_positive_pred/total_samples if total_samples else 0.0
+        overall_ratio_label = total_positive_label/total_samples if total_samples else 0.0
+        filtered_pred = [e for e in enriched_pred if e[1] >= min_total]
+        filtered_label = [e for e in enriched_label if e[1] >= min_total]
+        max_ratio_pred = max(filtered_pred, key=lambda x: (x[3], x[1])) if filtered_pred else None
+        max_ratio_label = max(filtered_label, key=lambda x: (x[3], x[1])) if filtered_label else None
+        top_ratio_pred = sorted(filtered_pred, key=lambda x: (-x[3], -x[1], x[0]))[:top_k]
+        top_ratio_label = sorted(filtered_label, key=lambda x: (-x[3], -x[1], x[0]))[:top_k]
+        top_count_pred = sorted(enriched_pred, key=lambda x: (-x[1], -x[3], x[0]))[:top_k]
+
         summary = {
             'distinct_ipc': distinct_count,
             'total_samples': total_samples,
-            'total_positive': total_positive,
-            'overall_positive_ratio': overall_ratio,
-            'max_positive_ratio_ipc': {
-                'ipc': max_ratio_entry[0],
-                'total': max_ratio_entry[1],
-                'positive': max_ratio_entry[2],
-                'positive_ratio': max_ratio_entry[3],
-            } if max_ratio_entry else None,
-            'top_positive_ratio': [
-                {
-                    'ipc': ipc,
-                    'total': tot,
-                    'positive': pos,
-                    'positive_ratio': ratio,
-                } for ipc,tot,pos,ratio in top_ratio
-            ],
+            # 兼容旧字段: 默认使用预测
+            'total_positive': total_positive_pred,
+            'overall_positive_ratio': overall_ratio_pred,
+            'positive_source': 'prediction',
+            'prediction_summary': {
+                'total_positive': total_positive_pred,
+                'overall_positive_ratio': overall_ratio_pred,
+                'max_positive_ratio_ipc': {
+                    'ipc': max_ratio_pred[0],
+                    'total': max_ratio_pred[1],
+                    'positive': max_ratio_pred[2],
+                    'positive_ratio': max_ratio_pred[3],
+                } if max_ratio_pred else None,
+                'top_positive_ratio': [
+                    {
+                        'ipc': ipc,
+                        'total': tot,
+                        'positive': pos,
+                        'positive_ratio': ratio,
+                    } for ipc,tot,pos,ratio in top_ratio_pred
+                ],
+            },
+            'label_summary': {
+                'total_positive': total_positive_label,
+                'overall_positive_ratio': overall_ratio_label,
+                'max_positive_ratio_ipc': {
+                    'ipc': max_ratio_label[0],
+                    'total': max_ratio_label[1],
+                    'positive': max_ratio_label[2],
+                    'positive_ratio': max_ratio_label[3],
+                } if max_ratio_label else None,
+                'top_positive_ratio': [
+                    {
+                        'ipc': ipc,
+                        'total': tot,
+                        'positive': pos,
+                        'positive_ratio': ratio,
+                    } for ipc,tot,pos,ratio in top_ratio_label
+                ],
+            },
             'top_total': [
                 {
                     'ipc': ipc,
                     'total': tot,
-                    'positive': pos,
-                    'positive_ratio': ratio,
-                } for ipc,tot,pos,ratio in top_count
+                    'prediction_positive': pos,
+                    'prediction_positive_ratio': ratio,
+                } for ipc,tot,pos,ratio in top_count_pred
             ],
+            'comparison': {
+                'overall_positive_ratio_diff': overall_ratio_pred - overall_ratio_label,
+                'overall_positive_ratio_abs_diff': abs(overall_ratio_pred - overall_ratio_label),
+                'total_positive_diff': total_positive_pred - total_positive_label,
+            },
             'min_total_filter': min_total,
             'top_k': top_k,
+            'gt_total_positive': total_positive_label,
+            'gt_overall_positive_ratio': overall_ratio_label,
         }
-        # 找出样本最多 IPC (top_total 第一项)
-        if top_count:
+        if top_count_pred:
             summary['max_total_ipc'] = {
-                'ipc': top_count[0][0],
-                'total': top_count[0][1],
-                'positive': top_count[0][2],
-                'positive_ratio': top_count[0][3],
+                'ipc': top_count_pred[0][0],
+                'total': top_count_pred[0][1],
+                'prediction_positive': top_count_pred[0][2],
+                'prediction_positive_ratio': top_count_pred[0][3],
             }
         res['ipc_summary'] = summary
 
@@ -494,22 +524,32 @@ def main():
                 lines = []
                 lines.append(f"统计了 {summary['distinct_ipc']} 个不同的 IPC 代码")
                 lines.append(f"总样本数: {summary['total_samples']}")
-                lines.append(f"总正例数: {summary['total_positive']}")
-                lines.append(f"总体正例占比: {summary['overall_positive_ratio']:.4f}")
-                if summary.get('max_positive_ratio_ipc'):
-                    m = summary['max_positive_ratio_ipc']
-                    lines.append(f"最高正例占比的 IPC: {m['ipc']} ({m['positive_ratio']:.4f}) ({m['positive']}/{m['total']})")
+                lines.append(f"[预测] 总正例数: {summary['total_positive']}  占比: {summary['overall_positive_ratio']:.4f}")
+                lines.append(f"[真实] 总正例数: {summary['gt_total_positive']}  占比: {summary['gt_overall_positive_ratio']:.4f}")
+                comp = summary.get('comparison', {})
+                if comp:
+                    lines.append(f"总体占比差(预测-真实): {comp.get('overall_positive_ratio_diff',0):.4f}")
+                pred_max = summary.get('prediction_summary', {}).get('max_positive_ratio_ipc')
+                label_max = summary.get('label_summary', {}).get('max_positive_ratio_ipc')
+                if pred_max:
+                    lines.append(f"[预测] 最高占比 IPC: {pred_max['ipc']} ({pred_max['positive_ratio']:.4f}) ({pred_max['positive']}/{pred_max['total']})")
+                if label_max:
+                    lines.append(f"[真实] 最高占比 IPC: {label_max['ipc']} ({label_max['positive_ratio']:.4f}) ({label_max['positive']}/{label_max['total']})")
                 if summary.get('max_total_ipc'):
                     m2 = summary['max_total_ipc']
-                    lines.append(f"样本最多的 IPC: {m2['ipc']} ({m2['total']} 条, 正例占比 {m2['positive_ratio']:.4f})")
+                    lines.append(f"样本最多的 IPC: {m2['ipc']} ({m2['total']} 条, 预测正例占比 {m2['prediction_positive_ratio']:.4f})")
                 lines.append("")
-                lines.append(f"正例占比前 {summary['top_k']} 名 (min_total={summary['min_total_filter']}):")
-                for e in summary['top_positive_ratio']:
+                lines.append(f"[预测] 正例占比前 {summary['top_k']} 名 (min_total={summary['min_total_filter']}):")
+                for e in summary['prediction_summary']['top_positive_ratio']:
+                    lines.append(f"  {e['ipc']}: {e['positive_ratio']:.4f} ({e['positive']}/{e['total']})")
+                lines.append("")
+                lines.append(f"[真实] 正例占比前 {summary['top_k']} 名 (min_total={summary['min_total_filter']}):")
+                for e in summary['label_summary']['top_positive_ratio']:
                     lines.append(f"  {e['ipc']}: {e['positive_ratio']:.4f} ({e['positive']}/{e['total']})")
                 lines.append("")
                 lines.append(f"样本数前 {summary['top_k']} 名:")
                 for e in summary['top_total']:
-                    lines.append(f"  {e['ipc']}: {e['total']} 条 (正例占比 {e['positive_ratio']:.4f})")
+                    lines.append(f"  {e['ipc']}: {e['total']} 条 (预测正例占比 {e['prediction_positive_ratio']:.4f})")
                 with open(args.ipc_summary_text, 'w', encoding='utf-8') as ftxt:
                     ftxt.write('\n'.join(lines))
                 print(f"[输出] IPC 文本汇总写入 {args.ipc_summary_text}")
