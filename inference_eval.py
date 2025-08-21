@@ -345,7 +345,7 @@ def main():
     parser.add_argument('--save-predictions', default=None, help='保存逐样本预测 jsonl')
     parser.add_argument('--metrics-output', default=None, help='保存指标 json')
     parser.add_argument('--gpus', default=None, help='指定可见 GPU (如 "0" 或 "0,1")')
-    parser.add_argument('--config', default='config/config.json', help='当输入为 CSV 时加载的配置文件 (含 preprocessConfig.validLabels/removeKeywords)')
+    parser.add_argument('--config', default='config/config.json', help='当输入为 CSV 时加载的配置文件 (含 preprocess_config.valid_labels/remove_keywords)')
     parser.add_argument('--ipc-key', default='ipc', help='IPC 字段名称 (用于统计)')
     parser.add_argument('--ipc-top-k', type=int, default=100, help='IPC 汇总中前K名 (比例/数量)')
     parser.add_argument('--ipc-min-total', type=int, default=1, help='计算最高占比/前K占比列表时的最小样本数过滤 (默认不过滤)')
@@ -365,11 +365,11 @@ def main():
         if not os.path.exists(args.config):
             raise FileNotFoundError(f'配置文件不存在: {args.config}')
         cfg_all = pp_load_config(args.config)
-        if 'preprocessConfig' not in cfg_all:
-            raise ValueError('配置文件缺少 preprocessConfig 节点')
-        pp_cfg = cfg_all['preprocessConfig']
-        remove_keywords = pp_cfg.get('removeKeywords') or []
-        valid_labels_cfg = pp_cfg.get('validLabels') or []
+        if 'preprocess_config' not in cfg_all:
+            raise ValueError('配置文件缺少 preprocess_config 节点')
+        pp_cfg = cfg_all['preprocess_config']
+        remove_keywords = pp_cfg.get('remove_keywords') or []
+        valid_labels_cfg = pp_cfg.get('valid_labels') or []
         print(f'[CSV] 读取并预处理: {args.input}')
         records = pp_process_csv_file(args.input, remove_keywords)
         print(f'[CSV] 原始记录数: {len(records)}  有效前缀候选: {len(valid_labels_cfg)}')

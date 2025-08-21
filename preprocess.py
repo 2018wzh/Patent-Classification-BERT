@@ -20,7 +20,7 @@ def load_config(path: str) -> Dict[str, Any]:
 
 
 def tokenize_and_format(
-    records: List[Dict[str, Any]], train_config: Dict[str, Any], batch_size: int
+    records: List[Dict[str, Any]], train_config: Dict[str, Any], preprocess_config: Dict[str, Any]
 ) -> List[Dict[str, Any]]:
     """批量高速分词 (CPU fast tokenizer)。
 
@@ -38,8 +38,8 @@ def tokenize_and_format(
     max_seq_length = train_config.get("max_seq_length", 512)
     text_column = train_config.get("text_column_name", "text")
     label_column = train_config.get("label_column_name", "label")
-
-    workers = int(train_config.get("tokenize_workers", 1) or 1)
+    batch_size = int(preprocess_config.get("batch_size", 512))
+    workers = int(preprocess_config.get("workers", 1) or 1)
     if workers < 1:
         workers = 1
     print("\n--- 开始批量分词 (fast tokenizer, CPU) ---")
@@ -262,22 +262,22 @@ def main():
     parser.add_argument(
         "--config",
         default=DEFAULT_CONFIG_PATH,
-        help="配置文件路径 (含 preprocessConfig/trainConfig)",
+        help="配置文件路径 (含 preprocess_config/train_config)",
     )
     parser.add_argument(
         "--convert-file",
         action="append",
         help="追加 / 覆盖要处理的 CSV 文件 (可多次指定)",
     )
-    parser.add_argument("--model", help="覆盖 trainConfig.model")
+    parser.add_argument("--model", help="覆盖 train_config.model")
     parser.add_argument(
-        "--max-seq-length", type=int, help="覆盖 trainConfig.max_seq_length"
+        "--max-seq-length", type=int, help="覆盖 train_config.max_seq_length"
     )
     parser.add_argument(
-        "--tokenize-batch-size", type=int, help="覆盖 trainConfig.tokenize_batch_size"
+        "--tokenize-batch-size", type=int, help="覆盖 train_config.tokenize_batch_size"
     )
     parser.add_argument(
-        "--tokenize-workers", type=int, help="分词线程数 (覆盖 trainConfig.tokenize_workers, 默认1)"
+        "--tokenize-workers", type=int, help="分词线程数 (覆盖 train_config.tokenize_workers, 默认1)"
     )
     parser.add_argument(
         "--remove-keyword", action="append", help="追加要删除的噪声关键字 (可多次)"
@@ -293,10 +293,10 @@ def main():
     )
     # --valid-only 已弃用: 始终处理全部记录并保留 valid 标记供下游过滤
     parser.add_argument(
-        "--text-column-name", help="覆盖 trainConfig.text_column_name (默认 text)"
+        "--text-column-name", help="覆盖 train_config.text_column_name (默认 text)"
     )
     parser.add_argument(
-        "--label-column-name", help="覆盖 trainConfig.label_column_name (默认 label)"
+        "--label-column-name", help="覆盖 train_config.label_column_name (默认 label)"
     )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
@@ -307,12 +307,12 @@ def main():
         sys.exit(1)
 
     full_cfg = load_config(config_path)
-    if "preprocessConfig" not in full_cfg or "trainConfig" not in full_cfg:
-        print("配置文件需包含 'preprocessConfig' 与 'trainConfig' 两个节点。")
+    if "preprocess_config" not in full_cfg or "train_config" not in full_cfg:
+        print("配置文件需包含 'preprocess_config' 与 'train_config' 两个节点。")
         sys.exit(1)
 
-    preprocess_cfg = full_cfg["preprocessConfig"]
-    train_cfg = full_cfg["trainConfig"]
+    preprocess_cfg = full_cfg["preprocess_config"]
+    train_cfg = full_cfg["train_config"]
 
     # 覆盖 train_cfg 相关参数
     if args.model:
@@ -329,23 +329,23 @@ def main():
         train_cfg["label_column_name"] = args.label_column_name
 
     # convert files
-    convert_files = preprocess_cfg.get("convertFiles", [])
+    convert_files = preprocess_cfg.get("convert_files", [])
     if args.convert_file:
         # 若用户提供则使用提供的列表 (覆盖)
         convert_files = args.convert_file
-    preprocess_cfg["convertFiles"] = convert_files
+    preprocess_cfg["convert_files"] = convert_files
 
     # remove keywords
-    remove_keywords = preprocess_cfg.get("removeKeywords", [])
+    remove_keywords = preprocess_cfg.get("remove_keywords", [])
     if args.remove_keyword:
         remove_keywords = list(dict.fromkeys(remove_keywords + args.remove_keyword))
-        preprocess_cfg["removeKeywords"] = remove_keywords
+        preprocess_cfg["remove_keywords"] = remove_keywords
 
     # valid labels 追加
     if args.valid_label:
         added = [v for v in args.valid_label if v]
-        preprocess_cfg["validLabels"] = list(
-            dict.fromkeys((preprocess_cfg.get("validLabels") or []) + added)
+        preprocess_cfg["valid_labels"] = list(
+            dict.fromkeys((preprocess_cfg.get("valid_labels") or []) + added)
         )
 
     if remove_keywords:
@@ -443,7 +443,7 @@ def main():
 
     # 主分类号匹配
     print("\n--- 开始主分类号匹配 ---")
-    cfg_valid = preprocess_cfg.get("validLabels") or []
+    cfg_valid = preprocess_cfg.get("valid_labels") or []
     cfg_valid_norm = sorted(
         {normalize_single_ipc(v) for v in cfg_valid if v}, key=lambda x: (-len(x), x)
     )

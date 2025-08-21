@@ -165,7 +165,7 @@ def main():
         sys.exit(1)
     with open(config_file, "r", encoding="utf-8") as f:
         full_cfg = json.load(f)
-    split_cfg = full_cfg.get("splitConfig") or {}
+    split_cfg = full_cfg.get("split_config") or {}
 
     input_path = split_cfg.get("input", DEFAULT_INPUT)
     outdir = split_cfg.get("outdir", DEFAULT_OUT_DIR)

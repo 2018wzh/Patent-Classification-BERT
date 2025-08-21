@@ -5,14 +5,14 @@ from copy import deepcopy
 
 CONFIG_FILE = "config/config.json"  # 统一配置文件
 
-SECTION_ORDER = ["trainConfig", "splitConfig", "preprocessConfig"]
+SECTION_ORDER = ["train_config", "split_config", "preprocess_config"]
 
 LIST_FIELDS = {
-    "preprocessConfig": ["convertFiles", "validLabels", "removeKeywords"],
+    "preprocess_config": ["convert_files", "valid_labels", "remove_keywords"],
 }
 
 def load_full_config():
-    """加载完整配置 (包含 trainConfig / splitConfig / preprocessConfig)"""
+    """加载完整配置 (包含 train_config / split_config / preprocess_config)"""
     if not os.path.exists(CONFIG_FILE):
         print(f"错误: 配置文件 {CONFIG_FILE} 不存在。")
         return None
@@ -114,7 +114,7 @@ def edit_dict_section(name: str, section: dict):
                 continue
             modified[k] = edit_list(k, modified[k])
         else:
-            print("无效指令。示例: e learning_rate  或  l convertFiles")
+            print("无效指令。示例: e learning_rate  或  l convert_files")
 
 def edit_list(name: str, current: list):
     print(f"\n--- 编辑列表 {name} (当前 {len(current)} 项) ---")
@@ -191,12 +191,12 @@ def interactive_configure():
             print("无效索引")
 
 def run_training():
-    """使用当前统一配置启动训练 (仅展示 trainConfig)"""
+    """使用当前统一配置启动训练 (仅展示 train_config)"""
     full = load_full_config()
     if full is None:
         return
-    train_cfg = full.get('trainConfig') or {}
-    print("\n即将使用 trainConfig: ")
+    train_cfg = full.get('train_config') or {}
+    print("\n即将使用 train_config: ")
     print(json.dumps(train_cfg, indent=2, ensure_ascii=False))
     confirm = input("确认开始训练? (y/n): ").strip().lower()
     if confirm!='y':
@@ -217,7 +217,7 @@ def main():
         print("\n主菜单:")
         print("1. 编辑配置 (train/split/preprocess)")
         print("2. 查看完整配置")
-        print("3. 运行训练 (使用 trainConfig)")
+        print("3. 运行训练 (使用 train_config)")
         print("4. 退出")
         choice = input("选择: ").strip()
         if choice=='1':

@@ -1,12 +1,12 @@
-"""读取 config/config.json 中的 packConfig 与 trainConfig, 自动将指定 jsonl (train/val/test) 打包为 .pt.
+"""读取 config/config.json 中的 pack_config 与 train_config, 自动将指定 jsonl (train/val/test) 打包为 .pt.
 
 不再支持命令行参数。执行:  python pack_dataset.py
 
 config.json 需包含:
-    trainConfig.train_file
-    trainConfig.validation_file (可选)
-    以及可选 test 文件 (trainConfig.test_file 或 dataset/test.jsonl 默认推断)
-    packConfig: {
+    train_config.train_file
+    train_config.validation_file (可选)
+    以及可选 test 文件 (train_config.test_file 或 dataset/test.jsonl 默认推断)
+    pack_config: {
             enable: true,
             max_seq_length: 512 | null,
             pad_token_id: 0,
@@ -112,10 +112,10 @@ def load_config(path: str = 'config/config.json'):
 
 def main():
     cfg = load_config()
-    train_cfg = cfg.get('trainConfig') or {}
-    pack_cfg = cfg.get('packConfig') or {}
+    train_cfg = cfg.get('train_config') or {}
+    pack_cfg = cfg.get('pack_config') or {}
     if not pack_cfg.get('enable', True):
-        print('packConfig.enable=false, 不执行打包。')
+        print('pack_config.enable=false, 不执行打包。')
         return
     suffix = pack_cfg.get('suffix', '_packed.pt')
     pad_id = pack_cfg.get('pad_token_id', 0)

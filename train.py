@@ -269,11 +269,11 @@ class TensorBoardCallback(TrainerCallback):
 
 def main():
     parser = argparse.ArgumentParser(description="BERT模型微调训练脚本")
-    # 新的配置文件使用统一的 config.json，其中包含 trainConfig 节点
+    # 新的配置文件使用统一的 config.json，其中包含 train_config 节点
     parser.add_argument(
         "--config_file",
         default="config/config.json",
-        help="配置文件路径 (包含 trainConfig 节点)",
+        help="配置文件路径 (包含 train_config 节点)",
     )
     parser.add_argument(
         "--resume",
@@ -282,15 +282,15 @@ def main():
     )
     cli_args = parser.parse_args()
 
-    # 从JSON文件加载配置，并取得 trainConfig 部分
+    # 从JSON文件加载配置，并取得 train_config 部分
     with open(cli_args.config_file, "r", encoding="utf-8") as f:
         full_config = json.load(f)
 
-    if "trainConfig" not in full_config:
-        raise ValueError("配置文件缺少 'trainConfig' 节点，请检查 config.json 结构。")
+    if "train_config" not in full_config:
+        raise ValueError("配置文件缺少 'train_config' 节点，请检查 config.json 结构。")
 
-    train_cfg_dict = full_config["trainConfig"]
-    pack_cfg = full_config.get('packConfig') or {}
+    train_cfg_dict = full_config["train_config"]
+    pack_cfg = full_config.get('pack_config') or {}
 
     # 为了方便访问，将字典转换为对象（不考虑旧格式兼容）
     class ConfigObject:
@@ -302,7 +302,7 @@ def main():
     # 将 CLI resume/no-resume 合并到 args; 若 config 中提供 resume_from_checkpoint 也保存
     setattr(args, 'cli_resume', bool(cli_args.resume))
     print(f"加载配置文件: {cli_args.config_file}")
-    print(f"trainConfig 字段: {list(train_cfg_dict.keys())}")
+    print(f"train_config 字段: {list(train_cfg_dict.keys())}")
 
     # 设置可见的GPU
     if args.gpus:
@@ -528,11 +528,11 @@ def main():
         except Exception as e:
             raise RuntimeError(f"加载数据集失败 {path}: {e}")
 
-    # 若 packConfig.enable 且未找到现成打包文件，可提示用户先执行 pack_dataset
+    # 若 pack_config.enable 且未找到现成打包文件，可提示用户先执行 pack_dataset
     train_dataset, train_packed = pick_dataset(args.train_file, 'train')
     eval_dataset, eval_packed = pick_dataset(args.validation_file, 'val')
     if pack_cfg.get('enable') and (not train_packed or not eval_packed):
-        print('[提示] packConfig.enable=true 但未检测到全部打包文件。可运行:')
+        print('[提示] pack_config.enable=true 但未检测到全部打包文件。可运行:')
         print('  python pack_dataset.py --inputs {0} {1} --out_dir {2} --max_seq_length {3}'.format(
             args.train_file,
             args.validation_file,

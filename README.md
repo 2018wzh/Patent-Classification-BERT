@@ -138,9 +138,9 @@ python train.py --model ./model --train_file ./dataset/train.jsonl --validation_
 1. 原始 tokenized jsonl (动态 padding)
 2. 预打包定长张量 *_packed.pt (跳过解析与 padding, 启动更快)
 
-在 `config/config.json` 中通过 `packConfig` 控制:
+在 `config/config.json` 中通过 `pack_config` 控制:
 ```jsonc
-"packConfig": {
+"pack_config": {
    "enable": true,
    "max_seq_length": 512,      // 省略或 null 时自动选取当前 jsonl 最长序列
    "pad_token_id": 0,
