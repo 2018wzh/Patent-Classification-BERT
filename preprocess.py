@@ -4,9 +4,11 @@ import sys
 import os
 import argparse
 import glob
-from typing import Dict, Any, List, Set, Optional
+import math
+from typing import Dict, Any, List, Set, Optional, Tuple
 from tqdm import tqdm
 from transformers import BertTokenizer
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 DEFAULT_CONFIG_PATH = os.path.join("config", "config.json")
 
@@ -37,9 +39,12 @@ def tokenize_and_format(
     text_column = train_config.get("text_column_name", "text")
     label_column = train_config.get("label_column_name", "label")
 
+    workers = int(train_config.get("tokenize_workers", 1) or 1)
+    if workers < 1:
+        workers = 1
     print("\n--- 开始批量分词 (fast tokenizer, CPU) ---")
     print(
-        f"模型/分词器: {model_name}  最大序列长度: {max_seq_length}  批次: {batch_size}"
+        f"模型/分词器: {model_name}  最大序列长度: {max_seq_length}  批次: {batch_size}  线程: {workers}"
     )
     tokenizer = BertTokenizer.from_pretrained(model_name, use_fast=True)
 
@@ -48,26 +53,67 @@ def tokenize_and_format(
     original_ids = [rec.get("id", "") for rec in records]
     total = len(texts)
     out: List[Dict[str, Any]] = []
-    for start in tqdm(range(0, total, batch_size), desc="分词", unit="batch"):
-        end = min(start + batch_size, total)
-        batch_texts = texts[start:end]
-        enc = tokenizer(
-            batch_texts,
-            padding=False,
-            max_length=max_seq_length,
-            truncation=True,
-            add_special_tokens=True,
-            return_attention_mask=True,
-        )
-        for i, input_ids in enumerate(enc["input_ids"]):
-            out.append(
-                {
-                    "input_ids": input_ids,
-                    "attention_mask": enc["attention_mask"][i],
-                    "label": labels[start + i],
-                    "original_id": original_ids[start + i],
-                }
+
+    if workers == 1:
+        # 单线程原逻辑
+        for start in tqdm(range(0, total, batch_size), desc="分词", unit="batch"):
+            end = min(start + batch_size, total)
+            batch_texts = texts[start:end]
+            enc = tokenizer(
+                batch_texts,
+                padding=False,
+                max_length=max_seq_length,
+                truncation=True,
+                add_special_tokens=True,
+                return_attention_mask=True,
             )
+            for i, input_ids in enumerate(enc["input_ids"]):
+                out.append(
+                    {
+                        "input_ids": input_ids,
+                        "attention_mask": enc["attention_mask"][i],
+                        "label": labels[start + i],
+                        "original_id": original_ids[start + i],
+                    }
+                )
+    else:
+        # 多线程：以 batch 为单位并行，将结果按 start 排序后合并
+        batch_starts = list(range(0, total, batch_size))
+        futures = []
+        def encode_range(start: int) -> Tuple[int, Dict[str, List[List[int]]]]:
+            end = min(start + batch_size, total)
+            batch_texts = texts[start:end]
+            enc_local = tokenizer(
+                batch_texts,
+                padding=False,
+                max_length=max_seq_length,
+                truncation=True,
+                add_special_tokens=True,
+                return_attention_mask=True,
+            )
+            return start, enc_local
+        results: List[Tuple[int, Dict[str, Any]]] = []
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for s in batch_starts:
+                futures.append(ex.submit(encode_range, s))
+            pbar = tqdm(total=len(batch_starts), desc="分词(多线程)", unit="batch")
+            for fut in as_completed(futures):
+                start, enc = fut.result()
+                results.append((start, enc))
+                pbar.update(1)
+            pbar.close()
+        # 按 start 排序，保证稳定顺序
+        results.sort(key=lambda x: x[0])
+        for start, enc in results:
+            for i, input_ids in enumerate(enc["input_ids"]):
+                out.append(
+                    {
+                        "input_ids": input_ids,
+                        "attention_mask": enc["attention_mask"][i],
+                        "label": labels[start + i],
+                        "original_id": original_ids[start + i],
+                    }
+                )
     print(f"分词完成，总样本: {len(out)}")
     return out
 
@@ -231,6 +277,9 @@ def main():
         "--tokenize-batch-size", type=int, help="覆盖 trainConfig.tokenize_batch_size"
     )
     parser.add_argument(
+        "--tokenize-workers", type=int, help="分词线程数 (覆盖 trainConfig.tokenize_workers, 默认1)"
+    )
+    parser.add_argument(
         "--remove-keyword", action="append", help="追加要删除的噪声关键字 (可多次)"
     )
     parser.add_argument(
@@ -272,6 +321,8 @@ def main():
         train_cfg["max_seq_length"] = args.max_seq_length
     if args.tokenize_batch_size:
         train_cfg["tokenize_batch_size"] = args.tokenize_batch_size
+    if args.tokenize_workers:
+        train_cfg["tokenize_workers"] = args.tokenize_workers
     if args.text_column_name:
         train_cfg["text_column_name"] = args.text_column_name
     if args.label_column_name:
