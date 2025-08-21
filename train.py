@@ -2,7 +2,8 @@ import json
 import argparse
 import torch
 import os
-from typing import Any, List, Dict
+import shutil
+from typing import Any, List, Dict, Optional
 from transformers import (
     BertConfig,
     BertTokenizer,
@@ -265,6 +266,81 @@ class TensorBoardCallback(TrainerCallback):
         if self.writer:
             self.writer.close()
             print("TensorBoard 记录已保存")
+
+
+class BestModelCallback(TrainerCallback):
+    """在评估过程中根据 metric_for_best_model 保存最优模型到 best_model/ 并复制 vocab。"""
+    def __init__(self, tokenizer: BertTokenizer, metric_name: str, greater_is_better: bool, output_dir: str):
+        self.tokenizer = tokenizer
+        self.metric_name = metric_name
+        self.greater_is_better = greater_is_better
+        self.output_dir = output_dir
+        self.best_metric: Optional[float] = None
+        self.best_step: Optional[int] = None
+        self.best_dir = os.path.join(output_dir, 'best_model')
+
+    def _improved(self, value: float) -> bool:
+        if self.best_metric is None:
+            return True
+        if self.greater_is_better:
+            return value > self.best_metric
+        return value < self.best_metric
+
+    def _copy_vocab(self, target_dir: str):
+        try:
+            vocab_path = getattr(self.tokenizer, 'vocab_file', None)
+            if vocab_path and os.path.isfile(vocab_path):
+                shutil.copy2(vocab_path, os.path.join(target_dir, os.path.basename(vocab_path)))
+            else:
+                # 兜底：尝试从原模型目录复制 vocab.txt
+                base_dir = getattr(self.tokenizer, 'name_or_path', None)
+                cand = os.path.join(base_dir, 'vocab.txt') if base_dir else None
+                if cand and os.path.isfile(cand):
+                    shutil.copy2(cand, os.path.join(target_dir, 'vocab.txt'))
+        except Exception as e:
+            print(f"[BestModel] 复制 vocab 失败: {e}")
+
+    def _save_best(self, model, step: int, value: float, args):
+        os.makedirs(self.best_dir, exist_ok=True)
+        print(f"[BestModel] 新最优 {self.metric_name}={value:.6f} (step={step}), 保存到 {self.best_dir}")
+        # 保存模型权重 & config
+        model.save_pretrained(self.best_dir)
+        # 保存 tokenizer (含 vocab)
+        try:
+            self.tokenizer.save_pretrained(self.best_dir)
+        except Exception:
+            self._copy_vocab(self.best_dir)
+        # 记录 meta
+        meta = {
+            'metric': self.metric_name,
+            'value': value,
+            'step': step,
+            'greater_is_better': self.greater_is_better,
+        }
+        try:
+            with open(os.path.join(self.best_dir, 'best_metric.json'), 'w', encoding='utf-8') as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[BestModel] 写入 best_metric.json 失败: {e}")
+
+    def on_evaluate(self, args, state, control, model=None, metrics=None, **kwargs):
+        if metrics is None:
+            return
+        # 只在主进程执行
+        if hasattr(args, 'local_rank') and args.local_rank not in (-1, 0):
+            return
+        key = f"eval_{self.metric_name}" if not self.metric_name.startswith('eval_') else self.metric_name
+        if key not in metrics:
+            return
+        try:
+            val = float(metrics[key])
+        except Exception:
+            return
+        if self._improved(val):
+            self.best_metric = val
+            self.best_step = state.global_step
+            if model is not None:
+                self._save_best(model, state.global_step, val, args)
 
 
 def main():
@@ -631,9 +707,11 @@ def main():
         }
 
     # 准备回调函数
-    callbacks: list[TrainerCallback] = [
-        TensorBoardCallback(tensorboard_log_dir)
-    ]  # 显式类型注解
+    callbacks: list[TrainerCallback] = [TensorBoardCallback(tensorboard_log_dir)]
+    # 添加最优模型保存回调
+    metric_name = training_args.metric_for_best_model or 'eval_loss'
+    greater_flag = bool(training_args.greater_is_better) if training_args.greater_is_better is not None else (metric_name != 'eval_loss')
+    callbacks.append(BestModelCallback(tokenizer, metric_name, greater_flag, args.output_dir))
 
     trainer = Trainer(
         model=model,
@@ -690,6 +768,23 @@ def main():
             train_result = trainer.train()
         train_metrics = train_result.metrics
         trainer.save_model()
+        # 复制 vocab 到输出根目录 (若不存在)
+        try:
+            root_vocab = os.path.join(args.output_dir, 'vocab.txt')
+            if not os.path.exists(root_vocab):
+                vocab_src = getattr(tokenizer, 'vocab_file', None)
+                if vocab_src and os.path.isfile(vocab_src):
+                    shutil.copy2(vocab_src, root_vocab)
+                else:
+                    # 尝试从模型源目录复制
+                    cand = os.path.join(args.model, 'vocab.txt') if hasattr(args, 'model') else None
+                    if cand and os.path.isfile(cand):
+                        shutil.copy2(cand, root_vocab)
+            else:
+                # 可选：同步更新 (此处保持存在即不覆盖)
+                pass
+        except Exception as e:
+            print(f"[保存] 复制 vocab.txt 失败: {e}")
         trainer.log_metrics("train", train_metrics)
         trainer.save_metrics("train", train_metrics)
         trainer.save_state()
