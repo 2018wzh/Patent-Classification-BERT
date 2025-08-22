@@ -20,24 +20,6 @@ def load_config(path: str) -> Dict[str, Any]:
         cfg = json.load(f)
     return cfg
 
-
-def _resolve_tokenize_params(preprocess_config: Dict[str, Any], train_config: Dict[str, Any]) -> tuple[int, int]:
-    # 兼容多种命名: 优先 preprocess_config.batch_size / workers
-    bs = preprocess_config.get("batch_size")
-    if bs is None:
-        bs = preprocess_config.get("batchSize")
-    if bs is None:
-        bs = train_config.get("tokenize_batch_size")
-    batch_size = int(bs or 512)
-    wk = preprocess_config.get("workers")
-    if wk is None:
-        wk = train_config.get("tokenize_workers")
-    workers = int(wk or 1)
-    if workers < 1:
-        workers = 1
-    return batch_size, workers
-
-
 def tokenize_and_format(
     records: List[Dict[str, Any]], train_config: Dict[str, Any], preprocess_config: Dict[str, Any]
 ) -> List[Dict[str, Any]]:
@@ -49,7 +31,8 @@ def tokenize_and_format(
     max_seq_length = train_config.get("max_seq_length", 512)
     text_column = train_config.get("text_column_name", "text")
     label_column = train_config.get("label_column_name", "label")
-    batch_size, workers = _resolve_tokenize_params(preprocess_config, train_config)
+    batch_size = preprocess_config.get("batch_size", 32)
+    workers = preprocess_config.get("workers", 1)
     print("\n--- 开始批量分词 (fast tokenizer, CPU) ---")
     print(
         f"模型/分词器: {model_name}  最大序列长度: {max_seq_length}  批次: {batch_size}  线程: {workers}"
@@ -311,10 +294,10 @@ def main():
         "--max-seq-length", type=int, help="覆盖 train_config.max_seq_length"
     )
     parser.add_argument(
-        "--tokenize-batch-size", type=int, help="覆盖 train_config.tokenize_batch_size"
+        "--batch-size", type=int, help="覆盖 preprocess_config.batch_size"
     )
     parser.add_argument(
-        "--tokenize-workers", type=int, help="分词线程数 (覆盖 train_config.tokenize_workers, 默认1)"
+        "--workers", type=int, help="分词线程数 (覆盖 preprocess_config.workers, 默认1)"
     )
     parser.add_argument(
         "--remove-keyword", action="append", help="追加要删除的噪声关键字 (可多次)"
@@ -331,7 +314,6 @@ def main():
     parser.add_argument(
         "--stream", action="store_true", help="流式模式: 逐行处理CSV并直接写出 data_origin.jsonl 与 tokenized_data.jsonl，避免整表入内存"
     )
-    # --valid-only 已弃用: 始终处理全部记录并保留 valid 标记供下游过滤
     parser.add_argument(
         "--text-column-name", help="覆盖 train_config.text_column_name (默认 text)"
     )
@@ -359,15 +341,15 @@ def main():
         train_cfg["model"] = args.model
     if args.max_seq_length:
         train_cfg["max_seq_length"] = args.max_seq_length
-    if args.tokenize_batch_size:
-        train_cfg["tokenize_batch_size"] = args.tokenize_batch_size
-    if args.tokenize_workers:
-        train_cfg["tokenize_workers"] = args.tokenize_workers
     if args.text_column_name:
         train_cfg["text_column_name"] = args.text_column_name
     if args.label_column_name:
         train_cfg["label_column_name"] = args.label_column_name
-
+    # 覆盖 preprocess_cfg 相关参数
+    if args.batch_size:
+        preprocess_cfg["batch_size"] = args.batch_size
+    if args.workers:
+        preprocess_cfg["workers"] = args.workers
     # convert files
     convert_files = preprocess_cfg.get("convert_files", [])
     if args.convert_file:
@@ -533,13 +515,57 @@ def main():
             print("错误: 训练配置中缺少 'model' 名称。")
             sys.exit(1)
         max_seq_length = train_cfg.get("max_seq_length", 512)
-        batch_size, workers = _resolve_tokenize_params(preprocess_cfg, train_cfg)
+        batch_size = preprocess_cfg.get("batch_size", 32)
+        workers = preprocess_cfg.get("workers", 1)
         tokenizer = BertTokenizer.from_pretrained(model_name, use_fast=True)
+        if args.skip_tokenize:
+            print(f"[流式] 分词已跳过 (--skip-tokenize)")
+        else:
+            print(
+                f"[流式] 分词配置 -> 线程: {workers}  批大小: {batch_size}  最大长度: {max_seq_length}  模型: {model_name}"
+            )
 
         # 流式聚合一个批
         buf_texts: List[str] = []
         buf_labels: List[int] = []
         buf_ids: List[str] = []
+
+        # 多线程流式分词支持
+        use_mt = (not args.skip_tokenize) and workers and workers > 1
+        stats_lock = threading.Lock()
+        futures = []
+        max_inflight = max(2, workers * 2) if use_mt else 0
+        ex = ThreadPoolExecutor(max_workers=workers) if use_mt else None
+
+        def _encode_and_enqueue(batch_texts: List[str], batch_labels: List[int], batch_ids: List[str]):
+            nonlocal tokenized_count_observed, tokenized_max_len_observed
+            enc = tokenizer(
+                batch_texts,
+                padding=False,
+                max_length=max_seq_length,
+                truncation=True,
+                add_special_tokens=True,
+                return_attention_mask=True,
+            )
+            local_count = 0
+            local_max = 0
+            for i, input_ids in enumerate(enc["input_ids"]):
+                rec = {
+                    "input_ids": input_ids,
+                    "attention_mask": enc["attention_mask"][i],
+                    "label": batch_labels[i],
+                    "original_id": batch_ids[i],
+                }
+                tok_q.put(json.dumps(rec, ensure_ascii=False) + "\n")
+                local_count += 1
+                if isinstance(input_ids, list):
+                    if len(input_ids) > local_max:
+                        local_max = len(input_ids)
+            # 线程安全更新统计
+            with stats_lock:
+                tokenized_count_observed += local_count
+                if local_max > tokenized_max_len_observed:
+                    tokenized_max_len_observed = local_max
 
         pbar = None
         try:
@@ -570,55 +596,44 @@ def main():
                         buf_labels.append(r["label"])  # type: ignore
                         buf_ids.append(r.get("id", ""))
                         if len(buf_texts) >= batch_size:
-                            enc = tokenizer(
-                                buf_texts,
-                                padding=False,
-                                max_length=max_seq_length,
-                                truncation=True,
-                                add_special_tokens=True,
-                                return_attention_mask=True,
-                            )
-                            for i, input_ids in enumerate(enc["input_ids"]):
-                                rec = {
-                                    "input_ids": input_ids,
-                                    "attention_mask": enc["attention_mask"][i],
-                                    "label": buf_labels[i],
-                                    "original_id": buf_ids[i],
-                                }
-                                tok_q.put(json.dumps(rec, ensure_ascii=False) + "\n")
-                                # 分词观测统计
-                                tokenized_count_observed += 1
-                                if isinstance(input_ids, list):
-                                    if len(input_ids) > tokenized_max_len_observed:
-                                        tokenized_max_len_observed = len(input_ids)
-                            buf_texts.clear(); buf_labels.clear(); buf_ids.clear()
+                            if use_mt and ex is not None:
+                                # 控制飞行中的任务数量，避免占用过多内存
+                                while len(futures) >= max_inflight:
+                                    # 回收最早一个完成的任务
+                                    done = None
+                                    for f in futures:
+                                        if f.done():
+                                            done = f
+                                            break
+                                    if done is None:
+                                        # 若都未完成，阻塞等待第一个完成
+                                        futures[0].result()
+                                        done = futures[0]
+                                    futures.remove(done)
+                                futures.append(ex.submit(_encode_and_enqueue, buf_texts, buf_labels, buf_ids))
+                            else:
+                                _encode_and_enqueue(buf_texts, buf_labels, buf_ids)
+                            buf_texts = []
+                            buf_labels = []
+                            buf_ids = []
             # 处理尾批
             if not args.skip_tokenize and buf_texts:
-                enc = tokenizer(
-                    buf_texts,
-                    padding=False,
-                    max_length=max_seq_length,
-                    truncation=True,
-                    add_special_tokens=True,
-                    return_attention_mask=True,
-                )
-                for i, input_ids in enumerate(enc["input_ids"]):
-                    rec = {
-                        "input_ids": input_ids,
-                        "attention_mask": enc["attention_mask"][i],
-                        "label": buf_labels[i],
-                        "original_id": buf_ids[i],
-                    }
-                    tok_q.put(json.dumps(rec, ensure_ascii=False) + "\n")
-                    tokenized_count_observed += 1
-                    if isinstance(input_ids, list):
-                        if len(input_ids) > tokenized_max_len_observed:
-                            tokenized_max_len_observed = len(input_ids)
+                if use_mt and ex is not None:
+                    futures.append(ex.submit(_encode_and_enqueue, buf_texts, buf_labels, buf_ids))
+                else:
+                    _encode_and_enqueue(buf_texts, buf_labels, buf_ids)
+            # 等待所有并行分词完成
+            if use_mt and ex is not None:
+                for f in futures:
+                    # 捕获异常以便尽早抛出
+                    f.result()
         finally:
             # 发送结束信号并等待写线程
             raw_q.put(None)
             tok_q.put(None)
             raw_thr.join(); tok_thr.join()
+            if ex is not None:
+                ex.shutdown(wait=True, cancel_futures=False)
             if pbar:
                 try:
                     pbar.close()
@@ -712,8 +727,8 @@ def main():
             "enabled": (not args.skip_tokenize),
             "model": train_cfg.get("model"),
             "max_seq_length_cfg": int(train_cfg.get("max_seq_length", 512)),
-            "batch_size": _resolve_tokenize_params(preprocess_cfg, train_cfg)[0],
-            "workers": _resolve_tokenize_params(preprocess_cfg, train_cfg)[1],
+            "batch_size": preprocess_cfg.get("batch_size", 32),
+            "workers": preprocess_cfg.get("workers", 1),
             "observed_max_input_len": int(tokenized_max_len_observed),
             "observed_count": int(tokenized_count_observed),
         },
