@@ -1,15 +1,15 @@
 echo "Preprocessing..."
-python preprocess.py
+python preprocess.py %1
 echo "Preprocessing finished."
 
 echo "Splitting dataset..."
-python split_dataset.py
+python split_dataset.py %1
 echo "Dataset split finished."
 
 echo "Packaging dataset..."
-python pack_dataset.py
+python pack_dataset.py %1
 echo "Packaging finished."
 
 echo "Starting training..."
-python train.py
+python train.py %1
 echo "Training finished."
