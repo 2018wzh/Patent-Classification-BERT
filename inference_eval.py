@@ -998,6 +998,30 @@ def _expand_inputs(pattern: str) -> List[str]:
     return []
 
 
+def _merge_prediction_files(pred_paths: List[Tuple[str, str]], out_path: str):
+    """将多个预测 jsonl 合并为一个，添加 source 字段标识来源文件。
+    pred_paths: 列表 (source_name, file_path)
+    """
+    if not pred_paths:
+        return
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, 'w', encoding='utf-8') as fout:
+        for source_name, p in pred_paths:
+            if not p or not os.path.exists(p):
+                continue
+            with open(p, 'r', encoding='utf-8') as fin:
+                for line in fin:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    obj['source'] = source_name
+                    fout.write(json.dumps(obj, ensure_ascii=False) + '\n')
+
+
 def main():
     parser = argparse.ArgumentParser(description='评估脚本: 支持 jsonl/json 以及 csv (直接预处理内存推理)')
     parser.add_argument('--model', required=True, help='模型目录 (含 config.json, tokenizer)')
@@ -1032,6 +1056,13 @@ def main():
     print(f"[输入] 匹配到 {len(inputs)} 个文件")
 
     multi = len(inputs) > 1
+
+    file_results: List[Dict[str, Any]] = []
+    # 聚合器
+    agg_tp=agg_tn=agg_fp=agg_fn=0
+    agg_samples = 0
+    agg_ipc: Dict[str, Dict[str, int]] = {}
+    pred_parts: List[Tuple[str, str]] = []  # (source_name, pred_path)
 
     for i_path in inputs:
         print(f"\n=== 处理输入: {i_path} ===")
@@ -1150,6 +1181,90 @@ def main():
             ipc_summary_text_path=ipc_text_path,
             metrics_output_path=metrics_path,
         )
+
+        # 累积到聚合
+        cm = res.get('confusion_matrix') or {}
+        agg_tn += int(cm.get('tn', 0))
+        agg_fp += int(cm.get('fp', 0))
+        agg_fn += int(cm.get('fn', 0))
+        agg_tp += int(cm.get('tp', 0))
+        agg_samples += int(res.get('samples', 0))
+        # 合并 IPC 统计
+        for row in (res.get('ipc_stats') or []):
+            k = row.get('ipc', '')
+            if not k and k != '':
+                continue
+            a = agg_ipc.get(k)
+            if a is None:
+                a = {'total':0,'label_pos':0,'pred_pos':0,'correct':0,'tp_pos':0}
+                agg_ipc[k] = a
+            a['total'] += int(row.get('total',0))
+            a['label_pos'] += int(row.get('label_pos',0))
+            a['pred_pos'] += int(row.get('pred_pos',0))
+            a['correct'] += int(row.get('correct',0))
+            a['tp_pos'] += int(row.get('tp_pos',0))
+
+        file_results.append({
+            'input': i_path,
+            'metrics_output': metrics_path,
+            'predictions_output': pred_path,
+            'ipc_summary_text': ipc_text_path,
+            'samples': int(res.get('samples', 0)),
+            'metrics': res.get('metrics'),
+        })
+        if pred_path:
+            pred_parts.append((stem, pred_path))
+
+    # 多文件聚合输出
+    if multi:
+        acc = (agg_tp + agg_tn) / max(1, (agg_tp+agg_tn+agg_fp+agg_fn))
+        prec = agg_tp / max(1, (agg_tp+agg_fp))
+        rec = agg_tp / max(1, (agg_tp+agg_fn))
+        f1 = (2*prec*rec)/(prec+rec) if (prec+rec)>0 else 0.0
+        res_all = {
+            'metrics': EvalResult(acc, prec, rec, f1, agg_tp, agg_tn, agg_fp, agg_fn, agg_samples).to_dict(),
+            'confusion_matrix': {'tn': int(agg_tn), 'fp': int(agg_fp), 'fn': int(agg_fn), 'tp': int(agg_tp)},
+            'classification_report': f'Aggregated over {len(inputs)} files',
+            'samples': int(agg_samples),
+            'model': str(args.model),
+            'input': inputs,
+            'already_tokenized': bool(args.already_tokenized),
+            'max_length': int(args.max_length),
+        }
+        # 聚合 IPC
+        ipc_stats_all: List[Dict[str, Any]] = []
+        for k, a in agg_ipc.items():
+            total_k = a['total']
+            prec_k = a['tp_pos']/a['pred_pos'] if a['pred_pos'] else 0.0
+            rec_k = a['tp_pos']/a['label_pos'] if a['label_pos'] else 0.0
+            f1_k = (2*prec_k*rec_k/(prec_k+rec_k)) if (prec_k+rec_k)>0 else 0.0
+            ipc_stats_all.append({
+                'ipc': k,
+                'total': total_k,
+                'accuracy': a['correct']/total_k if total_k else 0.0,
+                'label_pos': a['label_pos'],
+                'pred_pos': a['pred_pos'],
+                'tp_pos': a['tp_pos'],
+                'precision_pos': prec_k,
+                'recall_pos': rec_k,
+                'f1_pos': f1_k,
+            })
+        ipc_stats_all.sort(key=lambda x: x['total'], reverse=True)
+        res_all['ipc_stats'] = ipc_stats_all
+        res_all['files'] = file_results
+
+        # 写出聚合 metrics 与 IPC 文本 (使用未加后缀的路径)
+        _write_ipc_and_metrics(
+            res_all,
+            ipc_top_k=args.ipc_top_k,
+            ipc_min_total=args.ipc_min_total,
+            ipc_summary_text_path=args.ipc_summary_text,
+            metrics_output_path=args.metrics_output,
+        )
+
+        # 合并预测到一个文件
+        if args.save_predictions:
+            _merge_prediction_files(pred_parts, args.save_predictions)
 
 
 if __name__ == '__main__':
