@@ -1,7 +1,7 @@
 import os
 import json
 import argparse
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 
 import torch
@@ -14,11 +14,13 @@ try:
         load_config as pp_load_config,
         process_csv_file as pp_process_csv_file,
         normalize_single_ipc as pp_normalize_single_ipc,
+        process_csv_file_stream as pp_process_csv_file_stream,
     )
 except Exception:
     pp_load_config = None  # type: ignore
     pp_process_csv_file = None  # type: ignore
     pp_normalize_single_ipc = None  # type: ignore
+    pp_process_csv_file_stream = None  # type: ignore
 from sklearn.metrics import precision_recall_fscore_support, confusion_matrix, classification_report
 
 
@@ -157,6 +159,488 @@ def gpu_env_diag():
     print("====================")
 
 
+def _ensure_tok_model_compat(tokenizer: BertTokenizer, model: BertForSequenceClassification):
+    """确保 tokenizer 词表大小与模型嵌入大小一致；若 pad_token 缺失则添加并调整嵌入。
+    防止 input_ids 超出 embeddings.num_embeddings 导致 GPU gather 越界。
+    """
+    try:
+        vocab_sz_tok = len(tokenizer)
+        emb = model.get_input_embeddings()
+        vocab_sz_model = int(getattr(emb, 'num_embeddings', model.config.vocab_size))
+        # 确保 pad_token 存在
+        if tokenizer.pad_token_id is None:
+            pad_token = tokenizer.eos_token or tokenizer.sep_token or '[PAD]'
+            tokenizer.add_special_tokens({'pad_token': pad_token})
+            vocab_sz_tok = len(tokenizer)
+        if vocab_sz_tok != vocab_sz_model:
+            model.resize_token_embeddings(vocab_sz_tok)
+    except Exception as e:
+        print(f"[警告] 检查/对齐 tokenizer-模型 词表时出错: {e}")
+
+
+def _total_from_metadata(input_path: str) -> Optional[int]:
+    """尝试从同目录 metadata.json 获取该输入对应的样本总数，用于进度条 total。"""
+    try:
+        meta_path = os.path.join(os.path.dirname(input_path), 'metadata.json')
+        if not os.path.exists(meta_path):
+            return None
+        with open(meta_path, 'r', encoding='utf-8') as f:
+            meta = json.load(f)
+        split_paths = (meta.get('split_paths') or {})
+        splits_info = (meta.get('splits') or {})
+        # 优先匹配分割文件
+        for name, p in split_paths.items():
+            try:
+                if os.path.abspath(p) == os.path.abspath(input_path):
+                    v = splits_info.get(name)
+                    if isinstance(v, (int, float)):
+                        return int(v)
+            except Exception:
+                continue
+        # 退回匹配 tokenized/origin
+        paths = meta.get('paths') or {}
+        counts = meta.get('counts') or {}
+        for k in ('tokenized_jsonl', 'origin_jsonl'):
+            p = paths.get(k)
+            if p and os.path.abspath(p) == os.path.abspath(input_path):
+                v = counts.get('total_records')
+                if isinstance(v, (int, float)):
+                    return int(v)
+    except Exception:
+        return None
+    return None
+
+
+def evaluate_stream(
+    model_dir: str,
+    input: str,
+    batch_size: int,
+    max_length: int,
+    already_tokenized: bool,
+    text_key: str,
+    label_key: str,
+    save_predictions: Optional[str] = None,
+    ipc_key: str = 'ipc',
+) -> Dict[str, Any]:
+    """流式评估：一边读取一边(可选分词)一边推理，并增量写出预测与累计指标。仅支持 .jsonl。"""
+    if not input.lower().endswith('.jsonl'):
+        raise ValueError('流式模式仅支持 JSONL 输入')
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    tokenizer = BertTokenizer.from_pretrained(model_dir, use_fast=True)
+    model = BertForSequenceClassification.from_pretrained(model_dir).to(device)  # type: ignore
+    _ensure_tok_model_compat(tokenizer, model)
+    model.eval()
+
+    total = _total_from_metadata(input)
+    # 计数器
+    tp=tn=fp=fn=0
+    n_total = 0
+    prob_1_all: List[float] = []  # 仅用于可选写出，不整体保留 preds/labels 以节省内存
+    preds_tmp: List[int] = []
+    labels_tmp: List[int] = []
+    ipc_agg: Dict[str, Dict[str, int]] = {}
+    writer = open(save_predictions, 'w', encoding='utf-8') if save_predictions else None
+
+    def update_ipc(ipc_list: List[str], labels_b: List[int], preds_b: List[int]):
+        if not ipc_list:
+            return
+        for i, k in enumerate(ipc_list):
+            key = k or ''
+            a = ipc_agg.get(key)
+            if a is None:
+                a = {'total':0,'label_pos':0,'pred_pos':0,'correct':0,'tp_pos':0}
+                ipc_agg[key] = a
+            a['total'] += 1
+            lab = labels_b[i]
+            pred = preds_b[i]
+            if lab == 1:
+                a['label_pos'] += 1
+            if pred == 1:
+                a['pred_pos'] += 1
+            if pred == lab:
+                a['correct'] += 1
+            if pred == 1 and lab == 1:
+                a['tp_pos'] += 1
+
+    with open(input, 'r', encoding='utf-8') as f:
+        pbar = tqdm(f, total=total, desc='推理(流式)', unit='行')
+        # 批缓冲
+        buf_ids: List[List[int]] = []
+        buf_attn: List[List[int]] = []
+        buf_texts: List[str] = []
+        buf_labels: List[int] = []
+        buf_ipc: List[str] = []
+        idx = 0
+        for line in pbar:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            lab_val = obj.get(label_key) if label_key in obj else obj.get('labels')
+            if isinstance(lab_val, bool):
+                lab_val = 1 if lab_val else 0
+            if lab_val is None:
+                # 跳过无标签
+                continue
+            lab = int(lab_val)
+            buf_labels.append(lab)
+            buf_ipc.append(obj.get(ipc_key, ''))
+            if already_tokenized:
+                ids = obj.get('input_ids') or []
+                attn = obj.get('attention_mask') or [1]*len(ids)
+                buf_ids.append(ids)
+                buf_attn.append(attn)
+            else:
+                text = obj.get(text_key)
+                if not text:
+                    # 无文本则跳过
+                    buf_labels.pop(); buf_ipc.pop()
+                    continue
+                buf_texts.append(text)
+
+            if len(buf_labels) >= batch_size:
+                # 处理一个批
+                if already_tokenized:
+                    max_len_batch = min(max_length, max((len(x) for x in buf_ids), default=1))
+                    input_ids_tensor = torch.full((len(buf_ids), max_len_batch), tokenizer.pad_token_id or 0, dtype=torch.long)
+                    attn_tensor = torch.zeros((len(buf_attn), max_len_batch), dtype=torch.long)
+                    for i,(ids,attn) in enumerate(zip(buf_ids, buf_attn)):
+                        ids = ids[:max_len_batch]
+                        attn = attn[:max_len_batch]
+                        input_ids_tensor[i,:len(ids)] = torch.tensor(ids, dtype=torch.long)
+                        attn_tensor[i,:len(attn)] = torch.tensor(attn, dtype=torch.long)
+                    inputs = { 'input_ids': input_ids_tensor.to(device), 'attention_mask': attn_tensor.to(device) }
+                else:
+                    enc = tokenizer(buf_texts, truncation=True, max_length=max_length, padding=True, return_tensors='pt')
+                    inputs = {k: v.to(device) for k,v in enc.items()}
+                with torch.no_grad():
+                    logits = model(**inputs).logits
+                    probs = torch.softmax(logits, dim=-1)
+                    cls = torch.argmax(probs, dim=-1)
+                preds_b = cls.cpu().tolist()
+                prob1_b = probs[:,1].cpu().tolist()
+                # 更新指标
+                for j, pred in enumerate(preds_b):
+                    gt = buf_labels[j]
+                    if pred == 1 and gt == 1:
+                        tp += 1
+                    elif pred == 0 and gt == 0:
+                        tn += 1
+                    elif pred == 1 and gt == 0:
+                        fp += 1
+                    else:
+                        fn += 1
+                n_total += len(preds_b)
+                update_ipc(buf_ipc, buf_labels, preds_b)
+                if writer is not None:
+                    for j, pred in enumerate(preds_b):
+                        rec = {
+                            'index': idx + j,
+                            'pred': int(pred),
+                            'prob_valid': float(prob1_b[j]),
+                            'label': int(buf_labels[j])
+                        }
+                        if not already_tokenized:
+                            rec['text'] = buf_texts[j]
+                        if buf_ipc:
+                            rec['ipc'] = buf_ipc[j]
+                        writer.write(json.dumps(rec, ensure_ascii=False) + '\n')
+                idx += len(preds_b)
+                # 清空批
+                buf_ids.clear(); buf_attn.clear(); buf_texts.clear(); buf_labels.clear(); buf_ipc.clear()
+
+        # 尾批
+        if buf_labels:
+            if already_tokenized:
+                max_len_batch = min(max_length, max((len(x) for x in buf_ids), default=1))
+                input_ids_tensor = torch.full((len(buf_ids), max_len_batch), tokenizer.pad_token_id or 0, dtype=torch.long)
+                attn_tensor = torch.zeros((len(buf_attn), max_len_batch), dtype=torch.long)
+                for i,(ids,attn) in enumerate(zip(buf_ids, buf_attn)):
+                    ids = ids[:max_len_batch]
+                    attn = attn[:max_len_batch]
+                    input_ids_tensor[i,:len(ids)] = torch.tensor(ids, dtype=torch.long)
+                    attn_tensor[i,:len(attn)] = torch.tensor(attn, dtype=torch.long)
+                inputs = { 'input_ids': input_ids_tensor.to(device), 'attention_mask': attn_tensor.to(device) }
+            else:
+                enc = tokenizer(buf_texts, truncation=True, max_length=max_length, padding=True, return_tensors='pt')
+                inputs = {k: v.to(device) for k,v in enc.items()}
+            with torch.no_grad():
+                logits = model(**inputs).logits
+                probs = torch.softmax(logits, dim=-1)
+                cls = torch.argmax(probs, dim=-1)
+            preds_b = cls.cpu().tolist()
+            prob1_b = probs[:,1].cpu().tolist()
+            for j, pred in enumerate(preds_b):
+                gt = buf_labels[j]
+                if pred == 1 and gt == 1:
+                    tp += 1
+                elif pred == 0 and gt == 0:
+                    tn += 1
+                elif pred == 1 and gt == 0:
+                    fp += 1
+                else:
+                    fn += 1
+            n_total += len(preds_b)
+            update_ipc(buf_ipc, buf_labels, preds_b)
+            if writer is not None:
+                for j, pred in enumerate(preds_b):
+                    rec = {
+                        'index': idx + j,
+                        'pred': int(pred),
+                        'prob_valid': float(prob1_b[j]),
+                        'label': int(buf_labels[j])
+                    }
+                    if not already_tokenized:
+                        rec['text'] = buf_texts[j]
+                    if buf_ipc:
+                        rec['ipc'] = buf_ipc[j]
+                    writer.write(json.dumps(rec, ensure_ascii=False) + '\n')
+            # 无需清空，循环结束
+    if writer is not None:
+        writer.close()
+
+    # 汇总指标
+    accuracy = (tp + tn) / max(1, (tp+tn+fp+fn))
+    precision = tp / max(1, (tp+fp))
+    recall = tp / max(1, (tp+fn))
+    f1 = (2*precision*recall)/(precision+recall) if (precision+recall)>0 else 0.0
+    eval_res = EvalResult(accuracy, precision, recall, f1, tp, tn, fp, fn, n_total)
+
+    ipc_stats: List[Dict[str, Any]] = []
+    for k, a in ipc_agg.items():
+        total_k = a['total']
+        prec_k = a['tp_pos']/a['pred_pos'] if a['pred_pos'] else 0.0
+        rec_k = a['tp_pos']/a['label_pos'] if a['label_pos'] else 0.0
+        f1_k = (2*prec_k*rec_k/(prec_k+rec_k)) if (prec_k+rec_k)>0 else 0.0
+        ipc_stats.append({
+            'ipc': k,
+            'total': total_k,
+            'accuracy': a['correct']/total_k if total_k else 0.0,
+            'label_pos': a['label_pos'],
+            'pred_pos': a['pred_pos'],
+            'tp_pos': a['tp_pos'],
+            'precision_pos': prec_k,
+            'recall_pos': rec_k,
+            'f1_pos': f1_k,
+        })
+    ipc_stats.sort(key=lambda x: x['total'], reverse=True)
+
+    report_text = (
+        f"Streaming report (binary)\n"
+        f"samples={n_total} accuracy={accuracy:.4f} precision={precision:.4f} recall={recall:.4f} f1={f1:.4f}\n"
+        f"tn={tn} fp={fp} fn={fn} tp={tp}\n"
+    )
+
+    out = {
+        'metrics': eval_res.to_dict(),
+        'confusion_matrix': {'tn': int(tn), 'fp': int(fp), 'fn': int(fn), 'tp': int(tp)},
+        'classification_report': report_text,
+        'samples': int(n_total),
+        'model': str(model_dir),
+        'input': str(input),
+        'already_tokenized': bool(already_tokenized),
+        'max_length': int(max_length),
+        'ipc_stats': ipc_stats,
+    }
+    return out
+
+
+def evaluate_stream_csv(
+    model_dir: str,
+    csv_path: str,
+    batch_size: int,
+    max_length: int,
+    text_key: str,
+    label_key: str,
+    save_predictions: Optional[str] = None,
+    ipc_key: str = 'ipc',
+    remove_keywords: Optional[List[str]] = None,
+    valid_labels_cfg: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """CSV 流式评估：逐行读取 CSV -> 统一结构 -> IPC 前缀匹配打标 -> 批量分词 -> 推理 -> 增量写出/累计指标。"""
+    if pp_process_csv_file_stream is None or pp_normalize_single_ipc is None:
+        raise RuntimeError('预处理流式函数不可用，请确认 preprocess.py 可导入')
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    tokenizer = BertTokenizer.from_pretrained(model_dir, use_fast=True)
+    model = BertForSequenceClassification.from_pretrained(model_dir).to(device)  # type: ignore
+    _ensure_tok_model_compat(tokenizer, model)
+    model.eval()
+
+    valid_norm = sorted({pp_normalize_single_ipc(v) for v in (valid_labels_cfg or []) if v}, key=lambda x: (-len(x), x))
+    writer = open(save_predictions, 'w', encoding='utf-8') if save_predictions else None
+
+    tp=tn=fp=fn=0
+    n_total = 0
+    ipc_agg: Dict[str, Dict[str, int]] = {}
+    idx = 0
+
+    def update_ipc(ipc_list: List[str], labels_b: List[int], preds_b: List[int]):
+        if not ipc_list:
+            return
+        for i, k in enumerate(ipc_list):
+            key = k or ''
+            a = ipc_agg.get(key)
+            if a is None:
+                a = {'total':0,'label_pos':0,'pred_pos':0,'correct':0,'tp_pos':0}
+                ipc_agg[key] = a
+            a['total'] += 1
+            lab = labels_b[i]
+            pred = preds_b[i]
+            if lab == 1:
+                a['label_pos'] += 1
+            if pred == 1:
+                a['pred_pos'] += 1
+            if pred == lab:
+                a['correct'] += 1
+            if pred == 1 and lab == 1:
+                a['tp_pos'] += 1
+
+    # 批缓冲
+    buf_texts: List[str] = []
+    buf_labels: List[int] = []
+    buf_ipc: List[str] = []
+
+    # 逐行流式读取 CSV
+    for rec in tqdm(pp_process_csv_file_stream(csv_path, remove_keywords or []), desc='推理(流式CSV)', unit='行'):
+        try:
+            text = rec.get('text') or ''
+            if not text:
+                continue
+            ipc_code = pp_normalize_single_ipc(rec.get('ipc',''))
+            lab = 0
+            for pref in valid_norm:
+                if ipc_code.startswith(pref):
+                    lab = 1
+                    break
+            buf_texts.append(text)
+            buf_labels.append(int(lab))
+            buf_ipc.append(ipc_code)
+        except Exception:
+            continue
+
+        if len(buf_labels) >= batch_size:
+            enc = tokenizer(buf_texts, truncation=True, max_length=max_length, padding=True, return_tensors='pt')
+            inputs = {k: v.to(device) for k,v in enc.items()}
+            with torch.no_grad():
+                logits = model(**inputs).logits
+                probs = torch.softmax(logits, dim=-1)
+                cls = torch.argmax(probs, dim=-1)
+            preds_b = cls.cpu().tolist()
+            prob1_b = probs[:,1].cpu().tolist()
+            for j, pred in enumerate(preds_b):
+                gt = buf_labels[j]
+                if pred == 1 and gt == 1:
+                    tp += 1
+                elif pred == 0 and gt == 0:
+                    tn += 1
+                elif pred == 1 and gt == 0:
+                    fp += 1
+                else:
+                    fn += 1
+            n_total += len(preds_b)
+            update_ipc(buf_ipc, buf_labels, preds_b)
+            if writer is not None:
+                for j, pred in enumerate(preds_b):
+                    rec_out = {
+                        'index': idx + j,
+                        'pred': int(pred),
+                        'prob_valid': float(prob1_b[j]),
+                        'label': int(buf_labels[j]),
+                        'text': buf_texts[j],
+                        'ipc': buf_ipc[j],
+                    }
+                    writer.write(json.dumps(rec_out, ensure_ascii=False) + '\n')
+            idx += len(preds_b)
+            buf_texts.clear(); buf_labels.clear(); buf_ipc.clear()
+
+    # 尾批
+    if buf_labels:
+        enc = tokenizer(buf_texts, truncation=True, max_length=max_length, padding=True, return_tensors='pt')
+        inputs = {k: v.to(device) for k,v in enc.items()}
+        with torch.no_grad():
+            logits = model(**inputs).logits
+            probs = torch.softmax(logits, dim=-1)
+            cls = torch.argmax(probs, dim=-1)
+        preds_b = cls.cpu().tolist()
+        prob1_b = probs[:,1].cpu().tolist()
+        for j, pred in enumerate(preds_b):
+            gt = buf_labels[j]
+            if pred == 1 and gt == 1:
+                tp += 1
+            elif pred == 0 and gt == 0:
+                tn += 1
+            elif pred == 1 and gt == 0:
+                fp += 1
+            else:
+                fn += 1
+        n_total += len(preds_b)
+        update_ipc(buf_ipc, buf_labels, preds_b)
+        if writer is not None:
+            for j, pred in enumerate(preds_b):
+                rec_out = {
+                    'index': idx + j,
+                    'pred': int(pred),
+                    'prob_valid': float(prob1_b[j]),
+                    'label': int(buf_labels[j]),
+                    'text': buf_texts[j],
+                    'ipc': buf_ipc[j],
+                }
+                writer.write(json.dumps(rec_out, ensure_ascii=False) + '\n')
+
+    if writer is not None:
+        writer.close()
+
+    # 汇总
+    accuracy = (tp + tn) / max(1, (tp+tn+fp+fn))
+    precision = tp / max(1, (tp+fp))
+    recall = tp / max(1, (tp+fn))
+    f1 = (2*precision*recall)/(precision+recall) if (precision+recall)>0 else 0.0
+    eval_res = EvalResult(accuracy, precision, recall, f1, tp, tn, fp, fn, n_total)
+
+    ipc_stats: List[Dict[str, Any]] = []
+    for k, a in ipc_agg.items():
+        total_k = a['total']
+        prec_k = a['tp_pos']/a['pred_pos'] if a['pred_pos'] else 0.0
+        rec_k = a['tp_pos']/a['label_pos'] if a['label_pos'] else 0.0
+        f1_k = (2*prec_k*rec_k/(prec_k+rec_k)) if (prec_k+rec_k)>0 else 0.0
+        ipc_stats.append({
+            'ipc': k,
+            'total': total_k,
+            'accuracy': a['correct']/total_k if total_k else 0.0,
+            'label_pos': a['label_pos'],
+            'pred_pos': a['pred_pos'],
+            'tp_pos': a['tp_pos'],
+            'precision_pos': prec_k,
+            'recall_pos': rec_k,
+            'f1_pos': f1_k,
+        })
+    ipc_stats.sort(key=lambda x: x['total'], reverse=True)
+
+    report_text = (
+        f"Streaming CSV report (binary)\n"
+        f"samples={n_total} accuracy={accuracy:.4f} precision={precision:.4f} recall={recall:.4f} f1={f1:.4f}\n"
+        f"tn={tn} fp={fp} fn={fn} tp={tp}\n"
+    )
+
+    out = {
+        'metrics': eval_res.to_dict(),
+        'confusion_matrix': {'tn': int(tn), 'fp': int(fp), 'fn': int(fn), 'tp': int(tp)},
+        'classification_report': report_text,
+        'samples': int(n_total),
+        'model': str(model_dir),
+        'input': str(csv_path),
+        'already_tokenized': False,
+        'max_length': int(max_length),
+        'ipc_stats': ipc_stats,
+    }
+    return out
+
+
 def evaluate(model_dir: str,
              input: Optional[str],
              batch_size: int,
@@ -173,6 +657,7 @@ def evaluate(model_dir: str,
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     tokenizer = BertTokenizer.from_pretrained(model_dir, use_fast=True)
     model = BertForSequenceClassification.from_pretrained(model_dir)
+    _ensure_tok_model_compat(tokenizer, model)
     # 赋值回 model 以兼容部分类型检查器
     model = model.to(device)  # type: ignore
     model.eval()
@@ -338,6 +823,7 @@ def main():
     parser.add_argument('--model', required=True, help='模型目录 (含 config.json, tokenizer)')
     parser.add_argument('--input', required=True, help='标注数据 (.jsonl/.json 或 .csv)')
     parser.add_argument('--already-tokenized', action='store_true', help='输入为已分词 (含 input_ids/attention_mask) 的 jsonl/json')
+    parser.add_argument('--stream', action='store_true', help='启用流式：逐行读取、批量推理、增量写出，降低内存占用 (仅支持 JSONL)')
     parser.add_argument('--text-key', default='text')
     parser.add_argument('--label-key', default='label')
     parser.add_argument('--batch-size', type=int, default=32)
@@ -407,7 +893,44 @@ def main():
             in_memory_ipcs=ipcs_mem,
         )
     else:
-        res = evaluate(
+        # 流式 JSONL 推理
+        if args.stream:
+            if args.input.lower().endswith('.csv'):
+                # CSV 流式：直接逐行读取 CSV，在线分词与推理
+                if pp_load_config is None or pp_process_csv_file_stream is None or pp_normalize_single_ipc is None:
+                    raise RuntimeError('无法导入 preprocess 中的流式函数，请确保 preprocess.py 可用')
+                if not os.path.exists(args.config):
+                    raise FileNotFoundError(f'配置文件不存在: {args.config}')
+                cfg_all = pp_load_config(args.config)
+                if 'preprocess_config' not in cfg_all:
+                    raise ValueError('配置文件缺少 preprocess_config 节点')
+                pp_cfg = cfg_all['preprocess_config']
+                res = evaluate_stream_csv(
+                    model_dir=args.model,
+                    csv_path=args.input,
+                    batch_size=args.batch_size,
+                    max_length=args.max_length,
+                    text_key=args.text_key,
+                    label_key=args.label_key,
+                    save_predictions=args.save_predictions,
+                    ipc_key=args.ipc_key,
+                    remove_keywords=pp_cfg.get('remove_keywords') or [],
+                    valid_labels_cfg=pp_cfg.get('valid_labels') or [],
+                )
+            else:
+                res = evaluate_stream(
+                    model_dir=args.model,
+                    input=args.input,
+                    batch_size=args.batch_size,
+                    max_length=args.max_length,
+                    already_tokenized=args.already_tokenized,
+                    text_key=args.text_key,
+                    label_key=args.label_key,
+                    save_predictions=args.save_predictions,
+                    ipc_key=args.ipc_key,
+                )
+        else:
+            res = evaluate(
             model_dir=args.model,
             input=args.input,
             batch_size=args.batch_size,
@@ -420,6 +943,12 @@ def main():
         )
 
     # 基于已存在的 ipc_stats 生成汇总 (若存在) -- 添加预测 vs 真实双版本对比
+    # 控制台输出总体准确率
+    try:
+        acc_val = float((res.get('metrics') or {}).get('accuracy', 0.0))
+        print(f"[指标] 总体准确率(accuracy): {acc_val:.4f}")
+    except Exception:
+        pass
     ipc_stats = res.get('ipc_stats') or []
     if ipc_stats:
         top_k = max(1, args.ipc_top_k)
@@ -522,6 +1051,10 @@ def main():
         if args.ipc_summary_text:
             try:
                 lines = []
+                try:
+                    lines.append(f"总体准确率: {float((res.get('metrics') or {}).get('accuracy', 0.0)):.4f}")
+                except Exception:
+                    pass
                 lines.append(f"统计了 {summary['distinct_ipc']} 个不同的 IPC 代码")
                 lines.append(f"总样本数: {summary['total_samples']}")
                 lines.append(f"[预测] 总正例数: {summary['total_positive']}  占比: {summary['overall_positive_ratio']:.4f}")
