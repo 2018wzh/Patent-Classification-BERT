@@ -1,4 +1,5 @@
-import json, os, sys, math, random, collections
+import json, os, sys, math, random, collections, argparse, threading
+from queue import Queue
 from typing import List, Dict, Any, Tuple
 from tqdm import tqdm
 
@@ -47,6 +48,145 @@ def write_jsonl(path: str, records: List[Dict[str, Any]]):
         for r in tqdm(records, desc=f"写入 {os.path.basename(path)}", unit="条"):
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
     print(f"完成写入: {path}")
+
+
+def _writer_worker(path: str, q: Queue):
+    """后台写线程：从队列读取已带换行的字符串并写入文件，遇到 None 结束。"""
+    with open(path, "w", encoding="utf-8") as f:
+        while True:
+            item = q.get()
+            if item is None:
+                break
+            f.write(item)
+
+
+def _label_to_int(v) -> int:
+    if isinstance(v, bool):
+        return 1 if v else 0
+    try:
+        iv = int(v)
+    except Exception:
+        iv = 0
+    return 1 if iv == 1 else 0
+
+
+def stream_split_balance_binary(
+    input_path: str,
+    outdir: str,
+    ratios: Tuple[float, float, float],
+    seed: int,
+    label_key: str,
+    limit: int | None,
+    meta_counts: Dict[str, int] | None = None,
+):
+    """两遍扫描的流式平衡+分层划分：
+    1) 遍历统计总行数与二分类计数。
+    2) 以每类 min_count 为样本数做蓄水池采样，得到平衡集合；对每类样本打乱并按比例切分；
+       通过三个写线程异步写出 train/val/test JSONL，并展示进度条。
+    """
+    if not input_path.endswith(".jsonl"):
+        print("错误: 流式模式要求输入为 JSONL")
+        sys.exit(1)
+
+    # 如果提供了 metadata 计数，则跳过第一遍扫描
+    if meta_counts is not None:
+        total_lines = int(meta_counts.get("total_records", 0))
+        n1 = int(meta_counts.get("label_1", 0))
+        n0 = int(meta_counts.get("label_0", max(0, total_lines - n1)))
+    else:
+        print("无效的 metadata，退出")
+        return 0, 0, 0
+    if n0 + n1 == 0:
+        print("无有效样本，退出")
+        return 0, 0, 0
+    print(f"原始类别计数: class0={n0} class1={n1}  (正例比例={n1/(n0+n1):.3f})")
+    min_count = min(n0, n1)
+    if limit and isinstance(limit, int) and limit > 0:
+        per_class_cap = max(1, limit // 2)
+        if per_class_cap < min_count:
+            print(f"应用样本上限: 每类 {min_count} -> {per_class_cap}")
+        min_count = min(min_count, per_class_cap)
+    if min_count == 0:
+        print("某一类别计数为0，无法平衡，退出")
+        return 0, 0, 0
+
+    # 按类进行蓄水池采样
+    print("[流式] 蓄水池采样平衡集合")
+    rng = random.Random(seed)
+    reservoir = {0: [], 1: []}
+    seen = {0: 0, 1: 0}
+    with open(input_path, "r", encoding="utf-8") as f:
+        pbar = tqdm(total=total_lines, desc="采样", unit="行")
+        for line in f:
+            pbar.update(1)
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            cls = _label_to_int(r.get(label_key, 0))
+            seen[cls] += 1
+            res = reservoir[cls]
+            k = len(res)
+            if k < min_count:
+                res.append(r)
+            else:
+                # 算法 R: 以 min_count/seen[cls] 的概率替换一个位置
+                j = rng.randint(0, seen[cls] - 1)
+                if j < min_count:
+                    res[j] = r
+        pbar.close()
+
+    # 分层按比例切分
+    def split_one(lst: List[Dict[str, Any]]):
+        rng.shuffle(lst)
+        total = len(lst)
+        tr_n = int(round(total * ratios[0]))
+        val_n = int(round(total * ratios[1]))
+        test_n = total - tr_n - val_n
+        return lst[:tr_n], lst[tr_n : tr_n + val_n], lst[tr_n + val_n :]
+
+    t0, v0, te0 = split_one(reservoir[0])
+    t1, v1, te1 = split_one(reservoir[1])
+    train = t0 + t1
+    rng.shuffle(train)
+    val = v0 + v1
+    rng.shuffle(val)
+    test = te0 + te1
+    rng.shuffle(test)
+
+    # 异步写入
+    os.makedirs(outdir, exist_ok=True)
+    train_path = os.path.join(outdir, "train.jsonl")
+    val_path = os.path.join(outdir, "val.jsonl")
+    test_path = os.path.join(outdir, "test.jsonl")
+    tq, vq, eq = Queue(maxsize=10000), Queue(maxsize=10000), Queue(maxsize=10000)
+    tt = threading.Thread(target=_writer_worker, args=(train_path, tq), daemon=True)
+    vt = threading.Thread(target=_writer_worker, args=(val_path, vq), daemon=True)
+    et = threading.Thread(target=_writer_worker, args=(test_path, eq), daemon=True)
+    tt.start()
+    vt.start()
+    et.start()
+
+    total_write = len(train) + len(val) + len(test)
+    pbar_w = tqdm(total=total_write, desc="写出", unit="条")
+    for r in train:
+        tq.put(json.dumps(r, ensure_ascii=False) + "\n")
+        pbar_w.update(1)
+    for r in val:
+        vq.put(json.dumps(r, ensure_ascii=False) + "\n")
+        pbar_w.update(1)
+    for r in test:
+        eq.put(json.dumps(r, ensure_ascii=False) + "\n")
+        pbar_w.update(1)
+    pbar_w.close()
+
+    # 结束与同步
+    for q in (tq, vq, eq):
+        q.put(None)
+    for t in (tt, vt, et):
+        t.join()
+
+    return len(train), len(val), len(test)
 
 
 def stratified_split_balance_binary(
@@ -123,42 +263,12 @@ def stratified_split_balance_binary(
     return train, val, test
 
 
-def compute_stats(
-    name: str, data: List[Dict[str, Any]], label_key: str
-) -> Dict[str, Any]:
-    """
-    计算数据集统计信息，显示计算进度
-    """
-    print(f"正在计算 {name} 集统计信息...")
-
-    # 在内存中计算标签频率
-    freq = collections.Counter()
-    for r in tqdm(data, desc=f"统计 {name} 标签", unit="条", leave=False):
-        freq[r.get(label_key, "UNKNOWN")] += 1
-
-    if not data:
-        entropy = 0.0
-    else:
-        import math
-
-        total = len(data)
-        entropy = -sum((c / total) * math.log2(c / total) for c in freq.values())
-
-    stats = {
-        "split": name,
-        "size": len(data),
-        "unique_labels": len(freq),
-        "top5": freq.most_common(5),
-        "entropy": round(entropy, 4),
-    }
-
-    print(
-        f"{name} 集统计: {len(data)} 条记录, {len(freq)} 个唯一标签, 熵={entropy:.4f}"
-    )
-    return stats
-
-
 def main():
+    parser = argparse.ArgumentParser(description="数据集划分工具 (支持流式)")
+    parser.add_argument(
+        "--stream", action="store_true", help="启用流式平衡+划分+写入，适用于大JSONL"
+    )
+    args, _ = parser.parse_known_args()
     config_file = DEFAULT_CONFIG_FILE
     if not os.path.exists(config_file):
         print(f"错误: 配置文件不存在 {config_file}")
@@ -167,7 +277,20 @@ def main():
         full_cfg = json.load(f)
     split_cfg = full_cfg.get("split_config") or {}
 
-    input_path = split_cfg.get("input", DEFAULT_INPUT)
+    # 若存在 metadata.json，优先读取分词输出路径
+    meta_path = os.path.join(DEFAULT_OUT_DIR, "metadata.json")
+    input_path = split_cfg.get("input")
+    if (not input_path) and os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            cand = (meta.get("paths") or {}).get("tokenized_jsonl")
+            if cand:
+                input_path = cand
+                print(f"使用 metadata 指定的输入: {input_path}")
+        except Exception:
+            input_path = None
+    input_path = input_path or DEFAULT_INPUT
     outdir = split_cfg.get("outdir", DEFAULT_OUT_DIR)
     label_key = split_cfg.get("label_key", "label")
     ratios_raw = split_cfg.get("ratios", "0.8,0.1,0.1")
@@ -196,59 +319,104 @@ def main():
         print("错误: 比例必须是3个数字且和为1.0")
         sys.exit(1)
 
-    print(f"\n--- 第1步: 读取数据 ---")
-    data = load_data(input_path)
-    if not data:
-        print("数据为空，退出")
-        sys.exit(0)
+    # 预先初始化，便于后续写入 metadata 时引用
+    tr_n = va_n = te_n = 0
+    train: List[Dict[str, Any]] = []
+    val: List[Dict[str, Any]] = []
+    test: List[Dict[str, Any]] = []
 
-    original_total = len(data)
-    if limit and isinstance(limit, int) and 0 < limit < original_total:
-        rng = random.Random(seed)
-        print(f"应用样本限制: 原始 {original_total} -> 抽样 {limit}")
-        data = rng.sample(data, limit)
-        print(f"抽样完成: 当前样本数 {len(data)}")
+    if args.stream:
+        print(f"\n--- 流式: 平衡并分层划分 (二分类) ---")
+        # 若 metadata 提供 label 统计，直接跳过第一遍计数
+        meta_counts = None
+        if os.path.exists(meta_path):
+            try:
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    meta_json = json.load(f)
+                mc = meta_json.get("counts") or {}
+                if isinstance(mc, dict) and (
+                    "label_0" in mc or "label_1" in mc or "total_records" in mc
+                ):
+                    meta_counts = {
+                        "total_records": int(mc.get("total_records", 0)),
+                        "label_1": int(mc.get("label_1", 0)),
+                        "label_0": int(mc.get("label_0", 0)),
+                    }
+            except Exception:
+                meta_counts = None
+        tr_n, va_n, te_n = stream_split_balance_binary(
+            input_path, outdir, ratios_tuple, seed, label_key, limit, meta_counts
+        )
+    else:
+        print(f"\n--- 第1步: 读取数据 ---")
+        data = load_data(input_path)
+        if not data:
+            print("数据为空，退出")
+            sys.exit(0)
 
-    print(f"\n--- 第2步: 平衡并分层划分 (二分类) ---")
-    train, val, test = stratified_split_balance_binary(
-        data, ratios_tuple, seed, label_key
-    )
+        original_total = len(data)
+        if limit and isinstance(limit, int) and 0 < limit < original_total:
+            rng = random.Random(seed)
+            print(f"应用样本限制: 原始 {original_total} -> 抽样 {limit}")
+            data = rng.sample(data, limit)
+            print(f"抽样完成: 当前样本数 {len(data)}")
 
-    print(f"\n--- 第3步: 写入文件 ---")
-    os.makedirs(outdir, exist_ok=True)
-    files_to_write = [
-        (os.path.join(outdir, "train.jsonl"), train),
-        (os.path.join(outdir, "val.jsonl"), val),
-        (os.path.join(outdir, "test.jsonl"), test),
-    ]
-    for filepath, dataset in files_to_write:
-        write_jsonl(filepath, dataset)
+        print(f"\n--- 第2步: 平衡并分层划分 (二分类) ---")
+        train, val, test = stratified_split_balance_binary(
+            data, ratios_tuple, seed, label_key
+        )
 
-    print(f"\n--- 第4步: 计算统计信息 ---")
-    stats = [
-        compute_stats("train", train, label_key),
-        compute_stats("val", val, label_key),
-        compute_stats("test", test, label_key),
-        {
-            "total": len(data),
-            "seed": seed,
-            "ratios": list(ratios_tuple),
-            "original_total": original_total,
-            "limit": int(limit) if limit else None,
-        },
-    ]
-    stats_file = os.path.join(outdir, "split_stats.json")
-    print(f"正在保存统计信息到: {stats_file}")
-    with open(stats_file, "w", encoding="utf-8") as f:
-        json.dump(stats, f, ensure_ascii=False, indent=2)
+        print(f"\n--- 第3步: 写入文件 ---")
+        os.makedirs(outdir, exist_ok=True)
+        files_to_write = [
+            (os.path.join(outdir, "train.jsonl"), train),
+            (os.path.join(outdir, "val.jsonl"), val),
+            (os.path.join(outdir, "test.jsonl"), test),
+        ]
+        for filepath, dataset in files_to_write:
+            write_jsonl(filepath, dataset)
 
     print(f"\n=== 划分完成 ===")
-    print(f"训练集: {len(train)} 条")
-    print(f"验证集: {len(val)} 条")
-    print(f"测试集: {len(test)} 条")
-    print(f"总计: {len(data)} 条")
+    # 非流式时已在分支内打印详细信息
     print(f"输出目录: {outdir}")
-    print(f"统计文件: {stats_file}")
+
+    # 将分割后的样本数与路径写入 metadata.json，供 pack 使用
+    try:
+        train_path = os.path.join(outdir, "train.jsonl")
+        val_path = os.path.join(outdir, "val.jsonl")
+        test_path = os.path.join(outdir, "test.jsonl")
+        if args.stream:
+            sizes = {
+                "train": int(tr_n),
+                "val": int(va_n),
+                "test": int(te_n),
+            }
+        else:
+            sizes = {
+                "train": int(len(train)),
+                "val": int(len(val)),
+                "test": int(len(test)),
+            }
+        meta = {}
+        if os.path.exists(meta_path):
+            with open(meta_path, "r", encoding="utf-8") as f:
+                try:
+                    meta = json.load(f) or {}
+                except Exception:
+                    meta = {}
+        meta.setdefault("splits", {})
+        meta.setdefault("split_paths", {})
+        meta["splits"].update(sizes)
+        meta["split_paths"].update({
+            "train": train_path,
+            "val": val_path,
+            "test": test_path,
+        })
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+        print(f"已更新元数据: {meta_path}")
+    except Exception as e:
+        print(f"警告: 写入 metadata.json 失败: {e}")
 
 
 if __name__ == "__main__":

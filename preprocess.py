@@ -5,6 +5,8 @@ import os
 import argparse
 import glob
 import math
+import threading
+from queue import Queue
 from typing import Dict, Any, List, Set, Optional, Tuple
 from tqdm import tqdm
 from transformers import BertTokenizer
@@ -19,6 +21,23 @@ def load_config(path: str) -> Dict[str, Any]:
     return cfg
 
 
+def _resolve_tokenize_params(preprocess_config: Dict[str, Any], train_config: Dict[str, Any]) -> tuple[int, int]:
+    # 兼容多种命名: 优先 preprocess_config.batch_size / workers
+    bs = preprocess_config.get("batch_size")
+    if bs is None:
+        bs = preprocess_config.get("batchSize")
+    if bs is None:
+        bs = train_config.get("tokenize_batch_size")
+    batch_size = int(bs or 512)
+    wk = preprocess_config.get("workers")
+    if wk is None:
+        wk = train_config.get("tokenize_workers")
+    workers = int(wk or 1)
+    if workers < 1:
+        workers = 1
+    return batch_size, workers
+
+
 def tokenize_and_format(
     records: List[Dict[str, Any]], train_config: Dict[str, Any], preprocess_config: Dict[str, Any]
 ) -> List[Dict[str, Any]]:
@@ -30,10 +49,7 @@ def tokenize_and_format(
     max_seq_length = train_config.get("max_seq_length", 512)
     text_column = train_config.get("text_column_name", "text")
     label_column = train_config.get("label_column_name", "label")
-    batch_size = int(preprocess_config.get("batch_size", 512))
-    workers = int(preprocess_config.get("workers", 1) or 1)
-    if workers < 1:
-        workers = 1
+    batch_size, workers = _resolve_tokenize_params(preprocess_config, train_config)
     print("\n--- 开始批量分词 (fast tokenizer, CPU) ---")
     print(
         f"模型/分词器: {model_name}  最大序列长度: {max_seq_length}  批次: {batch_size}  线程: {workers}"
@@ -164,6 +180,18 @@ def normalize_ipc_list(ipc: str) -> List[str]:
     return normed
 
 
+def _writer_worker(path: str, q: Queue):
+    """后台写线程：从队列读取已带换行的字符串并写入文件，遇到 None 结束。"""
+    # 使用缓冲写入，线程结束时自动关闭
+    with open(path, "w", encoding="utf-8") as f:
+        while True:
+            item = q.get()
+            if item is None:
+                break
+            f.write(item)
+        # 文件关闭即刷新
+
+
 def derive_label(ipc_main: str) -> str:
     # 使用规范化后的主分类号，取前4个结构位 (字母 + 两位数字 + 字母) 作为标签
     if not ipc_main:
@@ -251,6 +279,19 @@ def process_csv_file(
     return data
 
 
+def process_csv_file_stream(
+    path: str, remove_keywords: Optional[List[str]] = None
+):
+    """流式读取 CSV，每行生成一个统一结构的记录。"""
+    with open(path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                yield unify_record(row, remove_keywords)
+            except Exception:
+                continue
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="预处理脚本: CSV -> 规范 JSON + tokenized jsonl"
@@ -286,6 +327,9 @@ def main():
     )
     parser.add_argument(
         "--skip-tokenize", action="store_true", help="仅解析与标注 valid, 不进行分词"
+    )
+    parser.add_argument(
+        "--stream", action="store_true", help="流式模式: 逐行处理CSV并直接写出 data_origin.jsonl 与 tokenized_data.jsonl，避免整表入内存"
     )
     # --valid-only 已弃用: 始终处理全部记录并保留 valid 标记供下游过滤
     parser.add_argument(
@@ -422,20 +466,32 @@ def main():
     print(f"通配符展开后文件总数: {len(expanded_list)}")
 
     # 逐个文件处理 (使用展开后的列表)
+    stream_counts: Dict[str, int] = {}
     for i, csv_path in enumerate(expanded_list, 1):
         print(f"\n--- 处理第 {i}/{len(expanded_list)} 个文件 ---")
         print(f"文件路径: {csv_path}")
         try:
-            records = process_csv_file(csv_path, remove_keywords)
-            print(f"成功处理 {len(records)} 条记录")
-            all_records.extend(records)
-            print(f"累计记录数: {len(all_records)}")
+            if args.stream:
+                # 流式不汇总到内存，先累计计数用于反馈
+                cnt = 0
+                for _ in process_csv_file_stream(csv_path, remove_keywords):
+                    cnt += 1
+                print(f"流式预扫描完成，约 {cnt} 条记录")
+                stream_counts[csv_path] = cnt
+                # 二次读取时再真正处理（直接在后续流式阶段完成），这里只记录总数占位
+                all_records.extend([])
+            else:
+                records = process_csv_file(csv_path, remove_keywords)
+                print(f"成功处理 {len(records)} 条记录")
+                all_records.extend(records)
+                print(f"累计记录数: {len(all_records)}")
         except Exception as e:
             print(f"错误: 处理文件 {csv_path} 时出错: {e}")
             continue
 
     print("\n=== 文件处理完成 ===")
-    print(f"总共处理了 {len(all_records)} 条记录")
+    if not args.stream:
+        print(f"总共处理了 {len(all_records)} 条记录")
 
     # 主分类号匹配
     print("\n--- 开始主分类号匹配 ---")
@@ -446,20 +502,142 @@ def main():
     print(f"有效前缀数量: {len(cfg_valid_norm)}")
 
     matched_count = 0
-    total_count = len(all_records)
-    for r in tqdm(all_records, desc="匹配", unit="记录"):
-        ipc_code = normalize_single_ipc(r.get("ipc", ""))
-        matched_prefix = ""
-        for pref in cfg_valid_norm:
-            if ipc_code.startswith(pref):
-                matched_prefix = pref
-                break
-        is_valid = bool(matched_prefix)
-        r["matched_prefix"] = matched_prefix  # 保存匹配到的前缀 (若无匹配为空串)
-        # 不再输出 valid 字段; 仅使用 label=1/0 表示有效性
-        r["label"] = 1 if is_valid else 0  # 数值标签 (二分类: 1=valid,0=invalid)
-        if is_valid:
-            matched_count += 1
+    total_count = 0
+    # 输出目录与文件路径
+    output_dir = args.output_dir
+    os.makedirs(output_dir, exist_ok=True)
+    raw_output_file_json = os.path.join(output_dir, "data_origin.json")
+    raw_output_file_jsonl = os.path.join(output_dir, "data_origin.jsonl")
+    tokenized_output_file = os.path.join(output_dir, "tokenized_data.jsonl")
+
+    # 统计分词观测长度与数量
+    tokenized_count_observed = 0
+    tokenized_max_len_observed = 0
+
+    if args.stream:
+        # 以 JSONL 形式写原始与分词结果（生产者-消费者异步写入）
+        print("[流式] 输出到 JSONL: data_origin.jsonl / tokenized_data.jsonl")
+        overall_total = sum(stream_counts.values()) if stream_counts else 0
+        if overall_total:
+            print(f"[流式] 预估总行数: {overall_total}")
+        # 写线程与队列
+        raw_q: Queue = Queue(maxsize=10000)
+        tok_q: Queue = Queue(maxsize=10000)
+        raw_thr = threading.Thread(target=_writer_worker, args=(raw_output_file_jsonl, raw_q), daemon=True)
+        tok_thr = threading.Thread(target=_writer_worker, args=(tokenized_output_file, tok_q), daemon=True)
+        raw_thr.start(); tok_thr.start()
+
+        # 为分词准备
+        model_name = train_cfg.get("model")
+        if not model_name:
+            print("错误: 训练配置中缺少 'model' 名称。")
+            sys.exit(1)
+        max_seq_length = train_cfg.get("max_seq_length", 512)
+        batch_size, workers = _resolve_tokenize_params(preprocess_cfg, train_cfg)
+        tokenizer = BertTokenizer.from_pretrained(model_name, use_fast=True)
+
+        # 流式聚合一个批
+        buf_texts: List[str] = []
+        buf_labels: List[int] = []
+        buf_ids: List[str] = []
+
+        pbar = None
+        try:
+            # 第二轮实际流处理
+            pbar = tqdm(total=overall_total if overall_total > 0 else None, desc="流式处理", unit="行")
+            for csv_path in expanded_list:
+                for r in process_csv_file_stream(csv_path, preprocess_cfg.get('remove_keywords')):
+                    total_count += 1
+                    if pbar:
+                        pbar.update(1)
+                    ipc_code = normalize_single_ipc(r.get("ipc", ""))
+                    matched_prefix = ""
+                    for pref in cfg_valid_norm:
+                        if ipc_code.startswith(pref):
+                            matched_prefix = pref
+                            break
+                    is_valid = bool(matched_prefix)
+                    if is_valid:
+                        matched_count += 1
+                    r["matched_prefix"] = matched_prefix
+                    r["label"] = 1 if is_valid else 0
+                    # 入队原始 JSONL 行
+                    raw_q.put(json.dumps(r, ensure_ascii=False) + "\n")
+
+                    # 分词缓冲
+                    if not args.skip_tokenize:
+                        buf_texts.append(r.get("text", ""))
+                        buf_labels.append(r["label"])  # type: ignore
+                        buf_ids.append(r.get("id", ""))
+                        if len(buf_texts) >= batch_size:
+                            enc = tokenizer(
+                                buf_texts,
+                                padding=False,
+                                max_length=max_seq_length,
+                                truncation=True,
+                                add_special_tokens=True,
+                                return_attention_mask=True,
+                            )
+                            for i, input_ids in enumerate(enc["input_ids"]):
+                                rec = {
+                                    "input_ids": input_ids,
+                                    "attention_mask": enc["attention_mask"][i],
+                                    "label": buf_labels[i],
+                                    "original_id": buf_ids[i],
+                                }
+                                tok_q.put(json.dumps(rec, ensure_ascii=False) + "\n")
+                                # 分词观测统计
+                                tokenized_count_observed += 1
+                                if isinstance(input_ids, list):
+                                    if len(input_ids) > tokenized_max_len_observed:
+                                        tokenized_max_len_observed = len(input_ids)
+                            buf_texts.clear(); buf_labels.clear(); buf_ids.clear()
+            # 处理尾批
+            if not args.skip_tokenize and buf_texts:
+                enc = tokenizer(
+                    buf_texts,
+                    padding=False,
+                    max_length=max_seq_length,
+                    truncation=True,
+                    add_special_tokens=True,
+                    return_attention_mask=True,
+                )
+                for i, input_ids in enumerate(enc["input_ids"]):
+                    rec = {
+                        "input_ids": input_ids,
+                        "attention_mask": enc["attention_mask"][i],
+                        "label": buf_labels[i],
+                        "original_id": buf_ids[i],
+                    }
+                    tok_q.put(json.dumps(rec, ensure_ascii=False) + "\n")
+                    tokenized_count_observed += 1
+                    if isinstance(input_ids, list):
+                        if len(input_ids) > tokenized_max_len_observed:
+                            tokenized_max_len_observed = len(input_ids)
+        finally:
+            # 发送结束信号并等待写线程
+            raw_q.put(None)
+            tok_q.put(None)
+            raw_thr.join(); tok_thr.join()
+            if pbar:
+                try:
+                    pbar.close()
+                except Exception:
+                    pass
+    else:
+        total_count = len(all_records)
+        for r in tqdm(all_records, desc="匹配", unit="记录"):
+            ipc_code = normalize_single_ipc(r.get("ipc", ""))
+            matched_prefix = ""
+            for pref in cfg_valid_norm:
+                if ipc_code.startswith(pref):
+                    matched_prefix = pref
+                    break
+            is_valid = bool(matched_prefix)
+            r["matched_prefix"] = matched_prefix
+            r["label"] = 1 if is_valid else 0
+            if is_valid:
+                matched_count += 1
     print("匹配完成:")
     print(
         f"  匹配成功: {matched_count} ({(matched_count/total_count*100) if total_count else 0:.1f}%)"
@@ -468,44 +646,85 @@ def main():
         f"  未匹配: {total_count - matched_count} ({((total_count-matched_count)/total_count*100) if total_count else 0:.1f}%)"
     )
 
-    # 分词
-    if args.skip_tokenize:
-        tokenized_data: List[Dict[str, Any]] = []
-        print("跳过分词 (--skip-tokenize)")
-    else:
-        print("分词目标: 全部记录 (label=1 或 0)")
-        target_records = all_records
-        batch_size = preprocess_cfg.get("batchSize", 512)
-        tokenized_data = tokenize_and_format(target_records, train_cfg, preprocess_cfg)
+    # 预先定义，便于后续引用
+    tokenized_data: List[Dict[str, Any]] = []
 
-    # 输出
-    output_dir = args.output_dir
-    os.makedirs(output_dir, exist_ok=True)
-    raw_output_file = os.path.join(output_dir, "data_origin.json")
-    tokenized_output_file = os.path.join(output_dir, "tokenized_data.jsonl")
+    # 分词 (非流式模式)
+    if not args.stream:
+        if args.skip_tokenize:
+            print("跳过分词 (--skip-tokenize)")
+        else:
+            print("分词目标: 全部记录 (label=1 或 0)")
+            target_records = all_records
+            tokenized_data = tokenize_and_format(target_records, train_cfg, preprocess_cfg)
+            # 非流式直接统计
+            tokenized_count_observed = len(tokenized_data)
+            try:
+                tokenized_max_len_observed = max((len(r.get("input_ids", [])) for r in tokenized_data), default=0)
+            except Exception:
+                tokenized_max_len_observed = 0
 
-    # 写出原始: 若指定 --only-valid 则只输出 valid 记录
-    origin_to_dump = all_records
-    print(f"写出原始数据 (全部记录): {raw_output_file}")
-    with open(raw_output_file, "w", encoding="utf-8") as f:
-        json.dump(origin_to_dump, f, ensure_ascii=False, indent=2)
+    # 输出 (非流式写法)
+    if not args.stream:
+        raw_output_file = raw_output_file_json
+        print(f"写出原始数据 (全部记录): {raw_output_file}")
+        with open(raw_output_file, "w", encoding="utf-8") as f:
+            json.dump(all_records, f, ensure_ascii=False, indent=2)
 
-    if not args.skip_tokenize:
-        print(f"写出分词数据: {tokenized_output_file}")
-        with open(tokenized_output_file, "w", encoding="utf-8") as f:
-            for record in tokenized_data:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
-    else:
-        print("未生成分词 jsonl (跳过)")
+        if not args.skip_tokenize:
+            print(f"写出分词数据: {tokenized_output_file}")
+            with open(tokenized_output_file, "w", encoding="utf-8") as f:
+                for record in tokenized_data:
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        else:
+            print("未生成分词 jsonl (跳过)")
 
     print("\n=== 处理完成 ===")
     print(f"总记录数: {total_count}")
-    # 兼容旧输出字段名称, 使用 matched_count
     print(f"匹配成功记录 (label=1): {matched_count}")
-    if not args.skip_tokenize:
-        print(f"分词样本数: {len(tokenized_data)}")
-        print(f"分词后数据输出: {tokenized_output_file}")
-    print(f"原始数据输出: {raw_output_file}")
+    if args.stream:
+        print(f"原始数据输出(JSONL): {raw_output_file_jsonl}")
+        if not args.skip_tokenize:
+            print(f"分词后数据输出(JSONL): {tokenized_output_file}")
+    else:
+        if not args.skip_tokenize:
+            print(f"分词样本数: {len(tokenized_data)}")
+            print(f"分词后数据输出: {tokenized_output_file}")
+        print(f"原始数据输出: {raw_output_file_json}")
+
+    # 写出元数据，供后续 split/pack 复用，跳过扫描
+    meta = {
+        "version": 1,
+        "stream": bool(args.stream),
+        "output_dir": output_dir,
+        "paths": {
+            "origin_json": raw_output_file_json,
+            "origin_jsonl": raw_output_file_jsonl,
+            "tokenized_jsonl": tokenized_output_file if not args.skip_tokenize else None,
+        },
+        "counts": {
+            "total_records": int(total_count),
+            "label_1": int(matched_count),
+            "label_0": int(total_count - matched_count),
+        },
+        "valid_labels": list(cfg_valid),
+        "tokenize": {
+            "enabled": (not args.skip_tokenize),
+            "model": train_cfg.get("model"),
+            "max_seq_length_cfg": int(train_cfg.get("max_seq_length", 512)),
+            "batch_size": _resolve_tokenize_params(preprocess_cfg, train_cfg)[0],
+            "workers": _resolve_tokenize_params(preprocess_cfg, train_cfg)[1],
+            "observed_max_input_len": int(tokenized_max_len_observed),
+            "observed_count": int(tokenized_count_observed),
+        },
+    }
+    meta_path = os.path.join(output_dir, "metadata.json")
+    try:
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+        print(f"元数据输出: {meta_path}")
+    except Exception as e:
+        print(f"警告: 写出元数据失败: {e}")
 
 
 if __name__ == "__main__":
