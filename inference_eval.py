@@ -6,6 +6,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 from tqdm import tqdm
 from transformers import BertTokenizer, BertForSequenceClassification
 
@@ -160,6 +161,27 @@ def gpu_env_diag():
     print("====================")
 
 
+def _maybe_init_dist() -> Tuple[bool, int, int, int]:
+    """返回 (is_dist, rank, world_size, local_rank)。如在 torchrun 环境则初始化进程组并设置设备。"""
+    try:
+        # torchrun 会设置以下环境变量
+        world_size = int(os.environ.get('WORLD_SIZE', '1'))
+        rank = int(os.environ.get('RANK', '0'))
+        local_rank = int(os.environ.get('LOCAL_RANK', os.environ.get('LOCAL_PROCESS_RANK', '0')))
+        is_dist = world_size > 1
+        if is_dist and not dist.is_initialized():
+            backend = 'nccl' if torch.cuda.is_available() else 'gloo'
+            dist.init_process_group(backend=backend, init_method='env://')
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.set_device(local_rank)
+            except Exception:
+                pass
+        return is_dist, rank, world_size, local_rank
+    except Exception:
+        return False, 0, 1, 0
+
+
 def _ensure_tok_model_compat(tokenizer: BertTokenizer, model: BertForSequenceClassification):
     """确保 tokenizer 词表大小与模型嵌入大小一致；若 pad_token 缺失则添加并调整嵌入。
     防止 input_ids 超出 embeddings.num_embeddings 导致 GPU gather 越界。
@@ -222,6 +244,9 @@ def evaluate_stream(
     label_key: str,
     save_predictions: Optional[str] = None,
     ipc_key: str = 'ipc',
+    shard_within_file: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> Dict[str, Any]:
     """流式评估：一边读取一边(可选分词)一边推理，并增量写出预测与累计指标。仅支持 .jsonl。"""
     if not input.lower().endswith('.jsonl'):
@@ -273,10 +298,18 @@ def evaluate_stream(
         buf_labels: List[int] = []
         buf_ipc: List[str] = []
         idx = 0
+        line_index = 0
+        batch_counter = 0
         for line in pbar:
             line = line.strip()
             if not line:
                 continue
+            # 仅当需要在文件内分片时，按行号 % world_size 选取
+            if shard_within_file and world_size > 1:
+                if (line_index % world_size) != rank:
+                    line_index += 1
+                    continue
+                line_index += 1
             try:
                 obj = json.loads(line)
             except Exception:
@@ -353,9 +386,13 @@ def evaluate_stream(
                 idx += len(preds_b)
                 # 清空批
                 buf_ids.clear(); buf_attn.clear(); buf_texts.clear(); buf_labels.clear(); buf_ipc.clear()
+                batch_counter += 1
+                if torch.cuda.is_available() and (batch_counter % 50 == 0):
+                    # 周期性释放缓存显存，避免峰值堆积
+                    torch.cuda.empty_cache()
 
         # 尾批
-        if buf_labels:
+    if buf_labels:
             if already_tokenized:
                 max_len_batch = min(max_length, max((len(x) for x in buf_ids), default=1))
                 input_ids_tensor = torch.full((len(buf_ids), max_len_batch), tokenizer.pad_token_id or 0, dtype=torch.long)
@@ -400,6 +437,8 @@ def evaluate_stream(
                     if buf_ipc:
                         rec['ipc'] = buf_ipc[j]
                     writer.write(json.dumps(rec, ensure_ascii=False) + '\n')
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             # 无需清空，循环结束
     if writer is not None:
         writer.close()
@@ -461,6 +500,9 @@ def evaluate_stream_csv(
     ipc_key: str = 'ipc',
     remove_keywords: Optional[List[str]] = None,
     valid_labels_cfg: Optional[List[str]] = None,
+    shard_within_file: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> Dict[str, Any]:
     """CSV 流式评估：逐行读取 CSV -> 统一结构 -> IPC 前缀匹配打标 -> 批量分词 -> 推理 -> 增量写出/累计指标。"""
     if pp_process_csv_file_stream is None or pp_normalize_single_ipc is None:
@@ -507,8 +549,15 @@ def evaluate_stream_csv(
     buf_ipc: List[str] = []
 
     # 逐行流式读取 CSV
+    line_index = 0
     for rec in tqdm(pp_process_csv_file_stream(csv_path, remove_keywords or []), desc='推理(流式CSV)', unit='行'):
         try:
+            # 文件内按行分片（如启用）
+            if shard_within_file and world_size > 1:
+                if (line_index % world_size) != rank:
+                    line_index += 1
+                    continue
+                line_index += 1
             text = rec.get('text') or ''
             if not text:
                 continue
@@ -524,7 +573,7 @@ def evaluate_stream_csv(
         except Exception:
             continue
 
-        if len(buf_labels) >= batch_size:
+    if len(buf_labels) >= batch_size:
             enc = tokenizer(buf_texts, truncation=True, max_length=max_length, padding=True, return_tensors='pt')
             inputs = {k: v.to(device) for k,v in enc.items()}
             with torch.no_grad():
@@ -558,6 +607,8 @@ def evaluate_stream_csv(
                     writer.write(json.dumps(rec_out, ensure_ascii=False) + '\n')
             idx += len(preds_b)
             buf_texts.clear(); buf_labels.clear(); buf_ipc.clear()
+            if torch.cuda.is_available() and (idx // max(1, batch_size)) % 50 == 0:
+                torch.cuda.empty_cache()
 
     # 尾批
     if buf_labels:
@@ -592,6 +643,8 @@ def evaluate_stream_csv(
                     'ipc': buf_ipc[j],
                 }
                 writer.write(json.dumps(rec_out, ensure_ascii=False) + '\n')
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     if writer is not None:
         writer.close()
@@ -1047,6 +1100,9 @@ def main():
         print(f"设置 CUDA_VISIBLE_DEVICES={args.gpus}")
     os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
     gpu_env_diag()
+    is_dist, rank, world_size, local_rank = _maybe_init_dist()
+    if is_dist:
+        print(f"[分布式] world_size={world_size} rank={rank} local_rank={local_rank}")
 
     # 扩展输入 (通配符)
     inputs = _expand_inputs(args.input)
@@ -1056,6 +1112,11 @@ def main():
     print(f"[输入] 匹配到 {len(inputs)} 个文件")
 
     multi = len(inputs) > 1
+    # 基于 rank 的文件级切分：若文件数量 >= world_size，则每个 rank 处理一个子集
+    if world_size > 1 and len(inputs) >= world_size:
+        inputs_rank = [p for i,p in enumerate(inputs) if (i % world_size) == rank]
+    else:
+        inputs_rank = inputs
 
     file_results: List[Dict[str, Any]] = []
     # 聚合器
@@ -1064,14 +1125,21 @@ def main():
     agg_ipc: Dict[str, Dict[str, int]] = {}
     pred_parts: List[Tuple[str, str]] = []  # (source_name, pred_path)
 
-    for i_path in inputs:
+    for i_path in inputs_rank:
         print(f"\n=== 处理输入: {i_path} ===")
         stem = os.path.splitext(os.path.basename(i_path))[0]
         # 为多文件场景派生输出路径
-        if multi:
+        # 分布式时为避免冲突，追加 rank 后缀
+        rank_suffix = (f"rank{rank}") if world_size > 1 else None
+        if multi or world_size > 1:
             metrics_path = _with_stem_suffix(args.metrics_output, stem)
             pred_path = _with_stem_suffix(args.save_predictions, stem)
             ipc_text_path = _with_stem_suffix(args.ipc_summary_text, stem) if args.ipc_summary_text else None
+            if rank_suffix:
+                metrics_path = _with_stem_suffix(metrics_path, rank_suffix)
+                pred_path = _with_stem_suffix(pred_path, rank_suffix)
+                if ipc_text_path:
+                    ipc_text_path = _with_stem_suffix(ipc_text_path, rank_suffix)
         else:
             metrics_path = args.metrics_output
             pred_path = args.save_predictions
@@ -1099,6 +1167,9 @@ def main():
                     ipc_key=args.ipc_key,
                     remove_keywords=pp_cfg.get('remove_keywords') or [],
                     valid_labels_cfg=pp_cfg.get('valid_labels') or [],
+                    shard_within_file=(world_size > 1 and len(inputs) < world_size),
+                    rank=rank,
+                    world_size=world_size,
                 )
             else:
                 if pp_load_config is None or pp_process_csv_file is None or pp_normalize_single_ipc is None:
@@ -1159,6 +1230,9 @@ def main():
                     label_key=args.label_key,
                     save_predictions=pred_path,
                     ipc_key=args.ipc_key,
+                    shard_within_file=(world_size > 1 and len(inputs) < world_size),
+                    rank=rank,
+                    world_size=world_size,
                 )
             else:
                 res = evaluate(
@@ -1216,6 +1290,7 @@ def main():
             pred_parts.append((stem, pred_path))
 
     # 多文件聚合输出
+    # 每进程写出自身聚合；多进程时，rank0 负责合并所有 rank 的聚合产物到最终文件
     if multi:
         acc = (agg_tp + agg_tn) / max(1, (agg_tp+agg_tn+agg_fp+agg_fn))
         prec = agg_tp / max(1, (agg_tp+agg_fp))
@@ -1254,17 +1329,126 @@ def main():
         res_all['files'] = file_results
 
         # 写出聚合 metrics 与 IPC 文本 (使用未加后缀的路径)
+        # 每个进程写出自身聚合（如分布式则带 rank 后缀）
+        metrics_path_final = args.metrics_output
+        ipc_text_path_final = args.ipc_summary_text
+        if world_size > 1:
+            metrics_path_final = _with_stem_suffix(metrics_path_final, f"rank{rank}")
+            if ipc_text_path_final:
+                ipc_text_path_final = _with_stem_suffix(ipc_text_path_final, f"rank{rank}")
         _write_ipc_and_metrics(
             res_all,
             ipc_top_k=args.ipc_top_k,
             ipc_min_total=args.ipc_min_total,
-            ipc_summary_text_path=args.ipc_summary_text,
-            metrics_output_path=args.metrics_output,
+            ipc_summary_text_path=ipc_text_path_final,
+            metrics_output_path=metrics_path_final,
         )
 
-        # 合并预测到一个文件
+        # 合并预测到一个文件（每进程先写自身 stem 合并；rank0 之后再合并所有 rank 的）
         if args.save_predictions:
-            _merge_prediction_files(pred_parts, args.save_predictions)
+            _merge_prediction_files(pred_parts, args.save_predictions if world_size == 1 else _with_stem_suffix(args.save_predictions, f"rank{rank}"))
+
+    # 分布式最终合并：仅 rank0 合并所有 rank 的聚合文件到最终目标
+    if world_size > 1:
+        try:
+            dist.barrier()
+        except Exception:
+            pass
+        if rank == 0:
+            # metrics 聚合
+            rank_metric_files = []
+            if multi:
+                # 多文件聚合场景：各 rank 写出了 metrics_output__rankX.json
+                base = args.metrics_output
+                d = os.path.dirname(base)
+                n, ext = os.path.splitext(os.path.basename(base))
+                for r in range(world_size):
+                    path = os.path.join(d, f"{n}__rank{r}{ext}")
+                    if os.path.exists(path):
+                        rank_metric_files.append(path)
+            # 也尝试搜集每文件/每rank metrics（可选）
+            # 汇总 rank 级 metrics
+            if rank_metric_files:
+                # 简单式：读取并合并 cm 与 ipc_stats
+                agg_tn2=agg_fp2=agg_fn2=agg_tp2=0
+                agg_samples2=0
+                agg_ipc2: Dict[str, Dict[str,int]] = {}
+                for p in rank_metric_files:
+                    try:
+                        with open(p, 'r', encoding='utf-8') as f:
+                            obj = json.load(f)
+                        cm = obj.get('confusion_matrix') or {}
+                        agg_tn2 += int(cm.get('tn',0))
+                        agg_fp2 += int(cm.get('fp',0))
+                        agg_fn2 += int(cm.get('fn',0))
+                        agg_tp2 += int(cm.get('tp',0))
+                        agg_samples2 += int(obj.get('samples',0))
+                        for row in (obj.get('ipc_stats') or []):
+                            k = row.get('ipc','')
+                            a = agg_ipc2.get(k)
+                            if a is None:
+                                a = {'total':0,'label_pos':0,'pred_pos':0,'correct':0,'tp_pos':0}
+                                agg_ipc2[k] = a
+                            a['total'] += int(row.get('total',0))
+                            a['label_pos'] += int(row.get('label_pos',0))
+                            a['pred_pos'] += int(row.get('pred_pos',0))
+                            a['correct'] += int(row.get('correct',0))
+                            a['tp_pos'] += int(row.get('tp_pos',0))
+                    except Exception:
+                        continue
+                acc2 = (agg_tp2 + agg_tn2) / max(1, (agg_tp2+agg_tn2+agg_fp2+agg_fn2))
+                prec2 = agg_tp2 / max(1, (agg_tp2+agg_fp2))
+                rec2 = agg_tp2 / max(1, (agg_tp2+agg_fn2))
+                f12 = (2*prec2*rec2)/(prec2+rec2) if (prec2+rec2)>0 else 0.0
+                res_all2 = {
+                    'metrics': EvalResult(acc2, prec2, rec2, f12, agg_tp2, agg_tn2, agg_fp2, agg_fn2, agg_samples2).to_dict(),
+                    'confusion_matrix': {'tn': int(agg_tn2), 'fp': int(agg_fp2), 'fn': int(agg_fn2), 'tp': int(agg_tp2)},
+                    'classification_report': f'Aggregated over {world_size} ranks',
+                    'samples': int(agg_samples2),
+                    'model': str(args.model),
+                    'input': inputs,
+                    'already_tokenized': bool(args.already_tokenized),
+                    'max_length': int(args.max_length),
+                }
+                ipc_stats_all2: List[Dict[str, Any]] = []
+                for k, a in agg_ipc2.items():
+                    total_k = a['total']
+                    prec_k = a['tp_pos']/a['pred_pos'] if a['pred_pos'] else 0.0
+                    rec_k = a['tp_pos']/a['label_pos'] if a['label_pos'] else 0.0
+                    f1_k = (2*prec_k*rec_k/(prec_k+rec_k)) if (prec_k+rec_k)>0 else 0.0
+                    ipc_stats_all2.append({
+                        'ipc': k,
+                        'total': total_k,
+                        'accuracy': a['correct']/total_k if total_k else 0.0,
+                        'label_pos': a['label_pos'],
+                        'pred_pos': a['pred_pos'],
+                        'tp_pos': a['tp_pos'],
+                        'precision_pos': prec_k,
+                        'recall_pos': rec_k,
+                        'f1_pos': f1_k,
+                    })
+                ipc_stats_all2.sort(key=lambda x: x['total'], reverse=True)
+                res_all2['ipc_stats'] = ipc_stats_all2
+                _write_ipc_and_metrics(
+                    res_all2,
+                    ipc_top_k=args.ipc_top_k,
+                    ipc_min_total=args.ipc_min_total,
+                    ipc_summary_text_path=args.ipc_summary_text,
+                    metrics_output_path=args.metrics_output,
+                )
+
+            # 合并各 rank 的预测
+            if args.save_predictions:
+                base = args.save_predictions
+                d = os.path.dirname(base)
+                n, ext = os.path.splitext(os.path.basename(base))
+                parts = []
+                for r in range(world_size):
+                    p = os.path.join(d, f"{n}__rank{r}{ext}")
+                    if os.path.exists(p):
+                        parts.append((f"rank{r}", p))
+                if parts:
+                    _merge_prediction_files(parts, base)
 
 
 if __name__ == '__main__':
