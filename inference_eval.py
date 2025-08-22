@@ -1,4 +1,5 @@
 import os
+import glob
 import json
 import argparse
 from typing import List, Dict, Any, Optional, Tuple
@@ -818,131 +819,8 @@ def evaluate(model_dir: str,
     return out
 
 
-def main():
-    parser = argparse.ArgumentParser(description='评估脚本: 支持 jsonl/json 以及 csv (直接预处理内存推理)')
-    parser.add_argument('--model', required=True, help='模型目录 (含 config.json, tokenizer)')
-    parser.add_argument('--input', required=True, help='标注数据 (.jsonl/.json 或 .csv)')
-    parser.add_argument('--already-tokenized', action='store_true', help='输入为已分词 (含 input_ids/attention_mask) 的 jsonl/json')
-    parser.add_argument('--stream', action='store_true', help='启用流式：逐行读取、批量推理、增量写出，降低内存占用 (仅支持 JSONL)')
-    parser.add_argument('--text-key', default='text')
-    parser.add_argument('--label-key', default='label')
-    parser.add_argument('--batch-size', type=int, default=32)
-    parser.add_argument('--max-length', type=int, default=512)
-    parser.add_argument('--save-predictions', default="outputs/prediction.jsonl", help='保存逐样本预测 jsonl')
-    parser.add_argument('--metrics-output', default="outputs/metrics.json", help='保存指标 json')
-    parser.add_argument('--gpus', default=None, help='指定可见 GPU (如 "0" 或 "0,1")')
-    parser.add_argument('--config', default='config/config.json', help='当输入为 CSV 时加载的配置文件 (含 preprocess_config.valid_labels/remove_keywords)')
-    parser.add_argument('--ipc-key', default='ipc', help='IPC 字段名称 (用于统计)')
-    parser.add_argument('--ipc-top-k', type=int, default=10, help='IPC 汇总中前K名 (比例/数量)')
-    parser.add_argument('--ipc-min-total', type=int, default=1, help='计算最高占比/前K占比列表时的最小样本数过滤 (默认不过滤)')
-    parser.add_argument('--ipc-summary-text', default="outputs/ipc_summary.txt", help='将 IPC 汇总指标写出为纯文本文件')
-    args = parser.parse_args()
-
-    if args.gpus:
-        os.environ['CUDA_VISIBLE_DEVICES'] = args.gpus
-        print(f"设置 CUDA_VISIBLE_DEVICES={args.gpus}")
-    os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
-    gpu_env_diag()
-
-    # CSV 模式: 读取 + 直接调用 preprocess 逻辑于内存中完成匹配
-    if args.input.lower().endswith('.csv'):
-        if pp_load_config is None or pp_process_csv_file is None or pp_normalize_single_ipc is None:
-            raise RuntimeError('无法导入 preprocess 中的函数，请确保 preprocess.py 存在且可导入')
-        if not os.path.exists(args.config):
-            raise FileNotFoundError(f'配置文件不存在: {args.config}')
-        cfg_all = pp_load_config(args.config)
-        if 'preprocess_config' not in cfg_all:
-            raise ValueError('配置文件缺少 preprocess_config 节点')
-        pp_cfg = cfg_all['preprocess_config']
-        remove_keywords = pp_cfg.get('remove_keywords') or []
-        valid_labels_cfg = pp_cfg.get('valid_labels') or []
-        print(f'[CSV] 读取并预处理: {args.input}')
-        records = pp_process_csv_file(args.input, remove_keywords)
-        print(f'[CSV] 原始记录数: {len(records)}  有效前缀候选: {len(valid_labels_cfg)}')
-        # 规范化前缀集合 (长优先)
-        valid_norm = sorted({pp_normalize_single_ipc(v) for v in valid_labels_cfg if v}, key=lambda x: (-len(x), x))
-        matched = 0
-        texts_mem: List[str] = []
-        labels_mem: List[int] = []
-        ipcs_mem: List[str] = []
-        for r in records:
-            ipc_code = pp_normalize_single_ipc(r.get('ipc',''))
-            lab = 0
-            for pref in valid_norm:
-                if ipc_code.startswith(pref):
-                    lab = 1
-                    break
-            if lab == 1:
-                matched += 1
-            texts_mem.append(r.get('text',''))
-            labels_mem.append(lab)
-            ipcs_mem.append(r.get('ipc',''))
-        print(f'[CSV] 匹配成功(label=1): {matched}  未匹配(label=0): {len(records)-matched}')
-        res = evaluate(
-            model_dir=args.model,
-            input=None,
-            batch_size=args.batch_size,
-            max_length=args.max_length,
-            already_tokenized=False,
-            text_key=args.text_key,
-            label_key=args.label_key,
-            save_predictions=args.save_predictions,
-            in_memory_texts=texts_mem,
-            in_memory_labels=labels_mem,
-            ipc_key=args.ipc_key,
-            in_memory_ipcs=ipcs_mem,
-        )
-    else:
-        # 流式 JSONL 推理
-        if args.stream:
-            if args.input.lower().endswith('.csv'):
-                # CSV 流式：直接逐行读取 CSV，在线分词与推理
-                if pp_load_config is None or pp_process_csv_file_stream is None or pp_normalize_single_ipc is None:
-                    raise RuntimeError('无法导入 preprocess 中的流式函数，请确保 preprocess.py 可用')
-                if not os.path.exists(args.config):
-                    raise FileNotFoundError(f'配置文件不存在: {args.config}')
-                cfg_all = pp_load_config(args.config)
-                if 'preprocess_config' not in cfg_all:
-                    raise ValueError('配置文件缺少 preprocess_config 节点')
-                pp_cfg = cfg_all['preprocess_config']
-                res = evaluate_stream_csv(
-                    model_dir=args.model,
-                    csv_path=args.input,
-                    batch_size=args.batch_size,
-                    max_length=args.max_length,
-                    text_key=args.text_key,
-                    label_key=args.label_key,
-                    save_predictions=args.save_predictions,
-                    ipc_key=args.ipc_key,
-                    remove_keywords=pp_cfg.get('remove_keywords') or [],
-                    valid_labels_cfg=pp_cfg.get('valid_labels') or [],
-                )
-            else:
-                res = evaluate_stream(
-                    model_dir=args.model,
-                    input=args.input,
-                    batch_size=args.batch_size,
-                    max_length=args.max_length,
-                    already_tokenized=args.already_tokenized,
-                    text_key=args.text_key,
-                    label_key=args.label_key,
-                    save_predictions=args.save_predictions,
-                    ipc_key=args.ipc_key,
-                )
-        else:
-            res = evaluate(
-            model_dir=args.model,
-            input=args.input,
-            batch_size=args.batch_size,
-            max_length=args.max_length,
-            already_tokenized=args.already_tokenized,
-            text_key=args.text_key,
-            label_key=args.label_key,
-            save_predictions=args.save_predictions,
-            ipc_key=args.ipc_key,
-        )
-
-    # 基于已存在的 ipc_stats 生成汇总 (若存在) -- 添加预测 vs 真实双版本对比
+def _write_ipc_and_metrics(res: Dict[str, Any], ipc_top_k: int, ipc_min_total: int, ipc_summary_text_path: Optional[str], metrics_output_path: str):
+    """基于返回结果写出 IPC 文本汇总与 metrics.json。"""
     # 控制台输出总体准确率
     try:
         acc_val = float((res.get('metrics') or {}).get('accuracy', 0.0))
@@ -950,9 +828,9 @@ def main():
     except Exception:
         pass
     ipc_stats = res.get('ipc_stats') or []
-    if ipc_stats:
-        top_k = max(1, args.ipc_top_k)
-        min_total = max(1, args.ipc_min_total)
+    if ipc_stats and ipc_summary_text_path:
+        top_k = max(1, ipc_top_k)
+        min_total = max(1, ipc_min_total)
         enriched_pred = []  # (ipc,total,pred_pos,ratio_pred)
         enriched_label = []  # (ipc,total,label_pos,ratio_label)
         for row in ipc_stats:
@@ -1048,51 +926,230 @@ def main():
             }
         res['ipc_summary'] = summary
 
-        if args.ipc_summary_text:
+        try:
+            lines = []
             try:
-                lines = []
-                try:
-                    lines.append(f"总体准确率: {float((res.get('metrics') or {}).get('accuracy', 0.0)):.4f}")
-                except Exception:
-                    pass
-                lines.append(f"统计了 {summary['distinct_ipc']} 个不同的 IPC 代码")
-                lines.append(f"总样本数: {summary['total_samples']}")
-                lines.append(f"[预测] 总正例数: {summary['total_positive']}  占比: {summary['overall_positive_ratio']:.4f}")
-                lines.append(f"[真实] 总正例数: {summary['gt_total_positive']}  占比: {summary['gt_overall_positive_ratio']:.4f}")
-                comp = summary.get('comparison', {})
-                if comp:
-                    lines.append(f"总体占比差(预测-真实): {comp.get('overall_positive_ratio_diff',0):.4f}")
-                pred_max = summary.get('prediction_summary', {}).get('max_positive_ratio_ipc')
-                label_max = summary.get('label_summary', {}).get('max_positive_ratio_ipc')
-                if pred_max:
-                    lines.append(f"[预测] 最高占比 IPC: {pred_max['ipc']} ({pred_max['positive_ratio']:.4f}) ({pred_max['positive']}/{pred_max['total']})")
-                if label_max:
-                    lines.append(f"[真实] 最高占比 IPC: {label_max['ipc']} ({label_max['positive_ratio']:.4f}) ({label_max['positive']}/{label_max['total']})")
-                if summary.get('max_total_ipc'):
-                    m2 = summary['max_total_ipc']
-                    lines.append(f"样本最多的 IPC: {m2['ipc']} ({m2['total']} 条, 预测正例占比 {m2['prediction_positive_ratio']:.4f})")
-                lines.append("")
-                lines.append(f"[预测] 正例占比前 {summary['top_k']} 名 (min_total={summary['min_total_filter']}):")
-                for e in summary['prediction_summary']['top_positive_ratio']:
-                    lines.append(f"  {e['ipc']}: {e['positive_ratio']:.4f} ({e['positive']}/{e['total']})")
-                lines.append("")
-                lines.append(f"[真实] 正例占比前 {summary['top_k']} 名 (min_total={summary['min_total_filter']}):")
-                for e in summary['label_summary']['top_positive_ratio']:
-                    lines.append(f"  {e['ipc']}: {e['positive_ratio']:.4f} ({e['positive']}/{e['total']})")
-                lines.append("")
-                lines.append(f"样本数前 {summary['top_k']} 名:")
-                for e in summary['top_total']:
-                    lines.append(f"  {e['ipc']}: {e['total']} 条 (预测正例占比 {e['prediction_positive_ratio']:.4f})")
-                with open(args.ipc_summary_text, 'w', encoding='utf-8') as ftxt:
-                    ftxt.write('\n'.join(lines))
-                print(f"[输出] IPC 文本汇总写入 {args.ipc_summary_text}")
-            except Exception as e:
-                print(f"[警告] 写入 IPC 文本汇总失败: {e}")
+                lines.append(f"总体准确率: {float((res.get('metrics') or {}).get('accuracy', 0.0)):.4f}")
+            except Exception:
+                pass
+            lines.append(f"统计了 {summary['distinct_ipc']} 个不同的 IPC 代码")
+            lines.append(f"总样本数: {summary['total_samples']}")
+            lines.append(f"[预测] 总正例数: {summary['total_positive']}  占比: {summary['overall_positive_ratio']:.4f}")
+            lines.append(f"[真实] 总正例数: {summary['gt_total_positive']}  占比: {summary['gt_overall_positive_ratio']:.4f}")
+            comp = summary.get('comparison', {})
+            if comp:
+                lines.append(f"总体占比差(预测-真实): {comp.get('overall_positive_ratio_diff',0):.4f}")
+            pred_max = summary.get('prediction_summary', {}).get('max_positive_ratio_ipc')
+            label_max = summary.get('label_summary', {}).get('max_positive_ratio_ipc')
+            if pred_max:
+                lines.append(f"[预测] 最高占比 IPC: {pred_max['ipc']} ({pred_max['positive_ratio']:.4f}) ({pred_max['positive']}/{pred_max['total']})")
+            if label_max:
+                lines.append(f"[真实] 最高占比 IPC: {label_max['ipc']} ({label_max['positive_ratio']:.4f}) ({label_max['positive']}/{label_max['total']})")
+            if summary.get('max_total_ipc'):
+                m2 = summary['max_total_ipc']
+                lines.append(f"样本最多的 IPC: {m2['ipc']} ({m2['total']} 条, 预测正例占比 {m2['prediction_positive_ratio']:.4f})")
+            lines.append("")
+            lines.append(f"[预测] 正例占比前 {summary['top_k']} 名 (min_total={summary['min_total_filter']}):")
+            for e in summary['prediction_summary']['top_positive_ratio']:
+                lines.append(f"  {e['ipc']}: {e['positive_ratio']:.4f} ({e['positive']}/{e['total']})")
+            lines.append("")
+            lines.append(f"[真实] 正例占比前 {summary['top_k']} 名 (min_total={summary['min_total_filter']}):")
+            for e in summary['label_summary']['top_positive_ratio']:
+                lines.append(f"  {e['ipc']}: {e['positive_ratio']:.4f} ({e['positive']}/{e['total']})")
+            lines.append("")
+            lines.append(f"样本数前 {summary['top_k']} 名:")
+            for e in summary['top_total']:
+                lines.append(f"  {e['ipc']}: {e['total']} 条 (预测正例占比 {e['prediction_positive_ratio']:.4f})")
+            os.makedirs(os.path.dirname(ipc_summary_text_path), exist_ok=True)
+            with open(ipc_summary_text_path, 'w', encoding='utf-8') as ftxt:
+                ftxt.write('\n'.join(lines))
+            print(f"[输出] IPC 文本汇总写入 {ipc_summary_text_path}")
+        except Exception as e:
+            print(f"[警告] 写入 IPC 文本汇总失败: {e}")
 
+    # 写 metrics.json
     metrics_json = json.dumps(res, ensure_ascii=False, indent=2)
-    with open(args.metrics_output, 'w', encoding='utf-8') as f:
+    os.makedirs(os.path.dirname(metrics_output_path), exist_ok=True)
+    with open(metrics_output_path, 'w', encoding='utf-8') as f:
         f.write(metrics_json)
-    print(f'[输出] 指标写入 {args.metrics_output}')
+    print(f"[输出] 指标写入 {metrics_output_path}")
+
+
+def _with_stem_suffix(path: str, stem: str) -> str:
+    """在文件名上加入 __{stem} 后缀 (扩展名前)。"""
+    d = os.path.dirname(path)
+    base = os.path.basename(path)
+    name, ext = os.path.splitext(base)
+    if not ext:
+        # 若无扩展名，默认作为目录/文件前缀处理
+        return os.path.join(path, f"{stem}")
+    return os.path.join(d, f"{name}__{stem}{ext}")
+
+
+def _expand_inputs(pattern: str) -> List[str]:
+    wc = set('*?[]')
+    if any(c in pattern for c in wc):
+        matches = glob.glob(pattern, recursive=True)
+        # 仅保留文件
+        return sorted([os.path.abspath(m) for m in matches if os.path.isfile(m)])
+    # 非通配符，直接返回存在的路径
+    if os.path.isfile(pattern):
+        return [os.path.abspath(pattern)]
+    return []
+
+
+def main():
+    parser = argparse.ArgumentParser(description='评估脚本: 支持 jsonl/json 以及 csv (直接预处理内存推理)')
+    parser.add_argument('--model', required=True, help='模型目录 (含 config.json, tokenizer)')
+    parser.add_argument('--input', required=True, help='标注数据 (.jsonl/.json 或 .csv)，支持通配符 (如 data/*.jsonl)')
+    parser.add_argument('--already-tokenized', action='store_true', help='输入为已分词 (含 input_ids/attention_mask) 的 jsonl/json')
+    parser.add_argument('--stream', action='store_true', help='启用流式：逐行读取、批量推理、增量写出，降低内存占用 (仅支持 JSONL)')
+    parser.add_argument('--text-key', default='text')
+    parser.add_argument('--label-key', default='label')
+    parser.add_argument('--batch-size', type=int, default=32)
+    parser.add_argument('--max-length', type=int, default=512)
+    parser.add_argument('--save-predictions', default="outputs/prediction.jsonl", help='保存逐样本预测 jsonl')
+    parser.add_argument('--metrics-output', default="outputs/metrics.json", help='保存指标 json')
+    parser.add_argument('--gpus', default=None, help='指定可见 GPU (如 "0" 或 "0,1")')
+    parser.add_argument('--config', default='config/config.json', help='当输入为 CSV 时加载的配置文件 (含 preprocess_config.valid_labels/remove_keywords)')
+    parser.add_argument('--ipc-key', default='ipc', help='IPC 字段名称 (用于统计)')
+    parser.add_argument('--ipc-top-k', type=int, default=10, help='IPC 汇总中前K名 (比例/数量)')
+    parser.add_argument('--ipc-min-total', type=int, default=1, help='计算最高占比/前K占比列表时的最小样本数过滤 (默认不过滤)')
+    parser.add_argument('--ipc-summary-text', default="outputs/ipc_summary.txt", help='将 IPC 汇总指标写出为纯文本文件')
+    args = parser.parse_args()
+
+    if args.gpus:
+        os.environ['CUDA_VISIBLE_DEVICES'] = args.gpus
+        print(f"设置 CUDA_VISIBLE_DEVICES={args.gpus}")
+    os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
+    gpu_env_diag()
+
+    # 扩展输入 (通配符)
+    inputs = _expand_inputs(args.input)
+    if not inputs:
+        # 若未匹配到，用原样路径尝试 (兼容非文件，如管道，尽管这里主要针对文件)
+        inputs = [args.input]
+    print(f"[输入] 匹配到 {len(inputs)} 个文件")
+
+    multi = len(inputs) > 1
+
+    for i_path in inputs:
+        print(f"\n=== 处理输入: {i_path} ===")
+        stem = os.path.splitext(os.path.basename(i_path))[0]
+        # 为多文件场景派生输出路径
+        if multi:
+            metrics_path = _with_stem_suffix(args.metrics_output, stem)
+            pred_path = _with_stem_suffix(args.save_predictions, stem)
+            ipc_text_path = _with_stem_suffix(args.ipc_summary_text, stem) if args.ipc_summary_text else None
+        else:
+            metrics_path = args.metrics_output
+            pred_path = args.save_predictions
+            ipc_text_path = args.ipc_summary_text
+
+        # 选择评估路径
+        if i_path.lower().endswith('.csv'):
+            if args.stream:
+                if pp_load_config is None or pp_process_csv_file_stream is None or pp_normalize_single_ipc is None:
+                    raise RuntimeError('无法导入 preprocess 中的流式函数，请确保 preprocess.py 可用')
+                if not os.path.exists(args.config):
+                    raise FileNotFoundError(f'配置文件不存在: {args.config}')
+                cfg_all = pp_load_config(args.config)
+                if 'preprocess_config' not in cfg_all:
+                    raise ValueError('配置文件缺少 preprocess_config 节点')
+                pp_cfg = cfg_all['preprocess_config']
+                res = evaluate_stream_csv(
+                    model_dir=args.model,
+                    csv_path=i_path,
+                    batch_size=args.batch_size,
+                    max_length=args.max_length,
+                    text_key=args.text_key,
+                    label_key=args.label_key,
+                    save_predictions=pred_path,
+                    ipc_key=args.ipc_key,
+                    remove_keywords=pp_cfg.get('remove_keywords') or [],
+                    valid_labels_cfg=pp_cfg.get('valid_labels') or [],
+                )
+            else:
+                if pp_load_config is None or pp_process_csv_file is None or pp_normalize_single_ipc is None:
+                    raise RuntimeError('无法导入 preprocess 中的函数，请确保 preprocess.py 存在且可导入')
+                if not os.path.exists(args.config):
+                    raise FileNotFoundError(f'配置文件不存在: {args.config}')
+                cfg_all = pp_load_config(args.config)
+                if 'preprocess_config' not in cfg_all:
+                    raise ValueError('配置文件缺少 preprocess_config 节点')
+                pp_cfg = cfg_all['preprocess_config']
+                remove_keywords = pp_cfg.get('remove_keywords') or []
+                valid_labels_cfg = pp_cfg.get('valid_labels') or []
+                print(f'[CSV] 读取并预处理: {i_path}')
+                records = pp_process_csv_file(i_path, remove_keywords)
+                print(f'[CSV] 原始记录数: {len(records)}  有效前缀候选: {len(valid_labels_cfg)}')
+                valid_norm = sorted({pp_normalize_single_ipc(v) for v in valid_labels_cfg if v}, key=lambda x: (-len(x), x))
+                matched = 0
+                texts_mem: List[str] = []
+                labels_mem: List[int] = []
+                ipcs_mem: List[str] = []
+                for r in records:
+                    ipc_code = pp_normalize_single_ipc(r.get('ipc',''))
+                    lab = 0
+                    for pref in valid_norm:
+                        if ipc_code.startswith(pref):
+                            lab = 1
+                            break
+                    if lab == 1:
+                        matched += 1
+                    texts_mem.append(r.get('text',''))
+                    labels_mem.append(lab)
+                    ipcs_mem.append(r.get('ipc',''))
+                print(f'[CSV] 匹配成功(label=1): {matched}  未匹配(label=0): {len(records)-matched}')
+                res = evaluate(
+                    model_dir=args.model,
+                    input=None,
+                    batch_size=args.batch_size,
+                    max_length=args.max_length,
+                    already_tokenized=False,
+                    text_key=args.text_key,
+                    label_key=args.label_key,
+                    save_predictions=pred_path,
+                    in_memory_texts=texts_mem,
+                    in_memory_labels=labels_mem,
+                    ipc_key=args.ipc_key,
+                    in_memory_ipcs=ipcs_mem,
+                )
+        else:
+            # JSON/JSONL
+            if args.stream:
+                res = evaluate_stream(
+                    model_dir=args.model,
+                    input=i_path,
+                    batch_size=args.batch_size,
+                    max_length=args.max_length,
+                    already_tokenized=args.already_tokenized,
+                    text_key=args.text_key,
+                    label_key=args.label_key,
+                    save_predictions=pred_path,
+                    ipc_key=args.ipc_key,
+                )
+            else:
+                res = evaluate(
+                    model_dir=args.model,
+                    input=i_path,
+                    batch_size=args.batch_size,
+                    max_length=args.max_length,
+                    already_tokenized=args.already_tokenized,
+                    text_key=args.text_key,
+                    label_key=args.label_key,
+                    save_predictions=pred_path,
+                    ipc_key=args.ipc_key,
+                )
+
+        # 写出该文件的汇总与指标
+        _write_ipc_and_metrics(
+            res,
+            ipc_top_k=args.ipc_top_k,
+            ipc_min_total=args.ipc_min_total,
+            ipc_summary_text_path=ipc_text_path,
+            metrics_output_path=metrics_path,
+        )
 
 
 if __name__ == '__main__':
