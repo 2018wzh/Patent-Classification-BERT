@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
+import gc
 from tqdm import tqdm
 from transformers import BertTokenizer, BertForSequenceClassification
 
@@ -201,6 +202,31 @@ def _ensure_tok_model_compat(tokenizer: BertTokenizer, model: BertForSequenceCla
         print(f"[警告] 检查/对齐 tokenizer-模型 词表时出错: {e}")
 
 
+def _cuda_cleanup():
+    """尽力释放 CUDA 显存与 Python 引用。"""
+    try:
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            try:
+                # 一些平台支持 IPC 缓存回收
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        gc.collect()
+    except Exception:
+        pass
+
+
 def _total_from_metadata(input_path: str) -> Optional[int]:
     """尝试从同目录 metadata.json 获取该输入对应的样本总数，用于进度条 total。"""
     try:
@@ -289,55 +315,111 @@ def evaluate_stream(
             if pred == 1 and lab == 1:
                 a['tp_pos'] += 1
 
-    with open(input, 'r', encoding='utf-8') as f:
-        pbar = tqdm(f, total=total, desc='推理(流式)', unit='行')
-        # 批缓冲
-        buf_ids: List[List[int]] = []
-        buf_attn: List[List[int]] = []
-        buf_texts: List[str] = []
-        buf_labels: List[int] = []
-        buf_ipc: List[str] = []
-        idx = 0
-        line_index = 0
-        batch_counter = 0
-        for line in pbar:
-            line = line.strip()
-            if not line:
-                continue
-            # 仅当需要在文件内分片时，按行号 % world_size 选取
-            if shard_within_file and world_size > 1:
-                if (line_index % world_size) != rank:
+    try:
+        with open(input, 'r', encoding='utf-8') as f:
+            pbar = tqdm(f, total=total, desc='推理(流式)', unit='行')
+            # 批缓冲
+            buf_ids: List[List[int]] = []
+            buf_attn: List[List[int]] = []
+            buf_texts: List[str] = []
+            buf_labels: List[int] = []
+            buf_ipc: List[str] = []
+            idx = 0
+            line_index = 0
+            batch_counter = 0
+            for line in pbar:
+                line = line.strip()
+                if not line:
+                    continue
+                # 仅当需要在文件内分片时，按行号 % world_size 选取
+                if shard_within_file and world_size > 1:
+                    if (line_index % world_size) != rank:
+                        line_index += 1
+                        continue
                     line_index += 1
+                try:
+                    obj = json.loads(line)
+                except Exception:
                     continue
-                line_index += 1
-            try:
-                obj = json.loads(line)
-            except Exception:
-                continue
-            lab_val = obj.get(label_key) if label_key in obj else obj.get('labels')
-            if isinstance(lab_val, bool):
-                lab_val = 1 if lab_val else 0
-            if lab_val is None:
-                # 跳过无标签
-                continue
-            lab = int(lab_val)
-            buf_labels.append(lab)
-            buf_ipc.append(obj.get(ipc_key, ''))
-            if already_tokenized:
-                ids = obj.get('input_ids') or []
-                attn = obj.get('attention_mask') or [1]*len(ids)
-                buf_ids.append(ids)
-                buf_attn.append(attn)
-            else:
-                text = obj.get(text_key)
-                if not text:
-                    # 无文本则跳过
-                    buf_labels.pop(); buf_ipc.pop()
+                lab_val = obj.get(label_key) if label_key in obj else obj.get('labels')
+                if isinstance(lab_val, bool):
+                    lab_val = 1 if lab_val else 0
+                if lab_val is None:
+                    # 跳过无标签
                     continue
-                buf_texts.append(text)
+                lab = int(lab_val)
+                buf_labels.append(lab)
+                buf_ipc.append(obj.get(ipc_key, ''))
+                if already_tokenized:
+                    ids = obj.get('input_ids') or []
+                    attn = obj.get('attention_mask') or [1]*len(ids)
+                    buf_ids.append(ids)
+                    buf_attn.append(attn)
+                else:
+                    text = obj.get(text_key)
+                    if not text:
+                        # 无文本则跳过
+                        buf_labels.pop(); buf_ipc.pop()
+                        continue
+                    buf_texts.append(text)
 
-            if len(buf_labels) >= batch_size:
-                # 处理一个批
+                if len(buf_labels) >= batch_size:
+                    # 处理一个批
+                    if already_tokenized:
+                        max_len_batch = min(max_length, max((len(x) for x in buf_ids), default=1))
+                        input_ids_tensor = torch.full((len(buf_ids), max_len_batch), tokenizer.pad_token_id or 0, dtype=torch.long)
+                        attn_tensor = torch.zeros((len(buf_attn), max_len_batch), dtype=torch.long)
+                        for i,(ids,attn) in enumerate(zip(buf_ids, buf_attn)):
+                            ids = ids[:max_len_batch]
+                            attn = attn[:max_len_batch]
+                            input_ids_tensor[i,:len(ids)] = torch.tensor(ids, dtype=torch.long)
+                            attn_tensor[i,:len(attn)] = torch.tensor(attn, dtype=torch.long)
+                        inputs = { 'input_ids': input_ids_tensor.to(device), 'attention_mask': attn_tensor.to(device) }
+                    else:
+                        enc = tokenizer(buf_texts, truncation=True, max_length=max_length, padding=True, return_tensors='pt')
+                        inputs = {k: v.to(device) for k,v in enc.items()}
+                    with torch.no_grad():
+                        logits = model(**inputs).logits
+                        probs = torch.softmax(logits, dim=-1)
+                        cls = torch.argmax(probs, dim=-1)
+                    preds_b = cls.cpu().tolist()
+                    prob1_b = probs[:,1].cpu().tolist()
+                    # 更新指标
+                    for j, pred in enumerate(preds_b):
+                        gt = buf_labels[j]
+                        if pred == 1 and gt == 1:
+                            tp += 1
+                        elif pred == 0 and gt == 0:
+                            tn += 1
+                        elif pred == 1 and gt == 0:
+                            fp += 1
+                        else:
+                            fn += 1
+                    n_total += len(preds_b)
+                    update_ipc(buf_ipc, buf_labels, preds_b)
+                    if writer is not None:
+                        for j, pred in enumerate(preds_b):
+                            rec = {
+                                'index': idx + j,
+                                'pred': int(pred),
+                                'prob_valid': float(prob1_b[j]),
+                                'label': int(buf_labels[j])
+                            }
+                            if not already_tokenized:
+                                rec['text'] = buf_texts[j]
+                            if buf_ipc:
+                                rec['ipc'] = buf_ipc[j]
+                            writer.write(json.dumps(rec, ensure_ascii=False) + '\n')
+                    idx += len(preds_b)
+                    # 清空批
+                    buf_ids.clear(); buf_attn.clear(); buf_texts.clear(); buf_labels.clear(); buf_ipc.clear()
+                    batch_counter += 1
+                    if torch.cuda.is_available() and (batch_counter % 50 == 0):
+                        # 周期性释放缓存显存，避免峰值堆积
+                        torch.cuda.empty_cache()
+
+            # 尾批
+            if buf_labels:
                 if already_tokenized:
                     max_len_batch = min(max_length, max((len(x) for x in buf_ids), default=1))
                     input_ids_tensor = torch.full((len(buf_ids), max_len_batch), tokenizer.pad_token_id or 0, dtype=torch.long)
@@ -357,7 +439,6 @@ def evaluate_stream(
                     cls = torch.argmax(probs, dim=-1)
                 preds_b = cls.cpu().tolist()
                 prob1_b = probs[:,1].cpu().tolist()
-                # 更新指标
                 for j, pred in enumerate(preds_b):
                     gt = buf_labels[j]
                     if pred == 1 and gt == 1:
@@ -383,66 +464,25 @@ def evaluate_stream(
                         if buf_ipc:
                             rec['ipc'] = buf_ipc[j]
                         writer.write(json.dumps(rec, ensure_ascii=False) + '\n')
-                idx += len(preds_b)
-                # 清空批
-                buf_ids.clear(); buf_attn.clear(); buf_texts.clear(); buf_labels.clear(); buf_ipc.clear()
-                batch_counter += 1
-                if torch.cuda.is_available() and (batch_counter % 50 == 0):
-                    # 周期性释放缓存显存，避免峰值堆积
+                if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-
-        # 尾批
-    if buf_labels:
-            if already_tokenized:
-                max_len_batch = min(max_length, max((len(x) for x in buf_ids), default=1))
-                input_ids_tensor = torch.full((len(buf_ids), max_len_batch), tokenizer.pad_token_id or 0, dtype=torch.long)
-                attn_tensor = torch.zeros((len(buf_attn), max_len_batch), dtype=torch.long)
-                for i,(ids,attn) in enumerate(zip(buf_ids, buf_attn)):
-                    ids = ids[:max_len_batch]
-                    attn = attn[:max_len_batch]
-                    input_ids_tensor[i,:len(ids)] = torch.tensor(ids, dtype=torch.long)
-                    attn_tensor[i,:len(attn)] = torch.tensor(attn, dtype=torch.long)
-                inputs = { 'input_ids': input_ids_tensor.to(device), 'attention_mask': attn_tensor.to(device) }
-            else:
-                enc = tokenizer(buf_texts, truncation=True, max_length=max_length, padding=True, return_tensors='pt')
-                inputs = {k: v.to(device) for k,v in enc.items()}
-            with torch.no_grad():
-                logits = model(**inputs).logits
-                probs = torch.softmax(logits, dim=-1)
-                cls = torch.argmax(probs, dim=-1)
-            preds_b = cls.cpu().tolist()
-            prob1_b = probs[:,1].cpu().tolist()
-            for j, pred in enumerate(preds_b):
-                gt = buf_labels[j]
-                if pred == 1 and gt == 1:
-                    tp += 1
-                elif pred == 0 and gt == 0:
-                    tn += 1
-                elif pred == 1 and gt == 0:
-                    fp += 1
-                else:
-                    fn += 1
-            n_total += len(preds_b)
-            update_ipc(buf_ipc, buf_labels, preds_b)
-            if writer is not None:
-                for j, pred in enumerate(preds_b):
-                    rec = {
-                        'index': idx + j,
-                        'pred': int(pred),
-                        'prob_valid': float(prob1_b[j]),
-                        'label': int(buf_labels[j])
-                    }
-                    if not already_tokenized:
-                        rec['text'] = buf_texts[j]
-                    if buf_ipc:
-                        rec['ipc'] = buf_ipc[j]
-                    writer.write(json.dumps(rec, ensure_ascii=False) + '\n')
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            # 无需清空，循环结束
-    if writer is not None:
-        writer.close()
-
+                # 无需清空，循环结束
+    finally:
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception:
+                pass
+        # 显式删除大对象并清理显存
+        try:
+            del model
+        except Exception:
+            pass
+        try:
+            del tokenizer
+        except Exception:
+            pass
+        _cuda_cleanup()
     # 汇总指标
     accuracy = (tp + tn) / max(1, (tp+tn+fp+fn))
     precision = tp / max(1, (tp+fp))
@@ -548,32 +588,71 @@ def evaluate_stream_csv(
     buf_labels: List[int] = []
     buf_ipc: List[str] = []
 
-    # 逐行流式读取 CSV
-    line_index = 0
-    for rec in tqdm(pp_process_csv_file_stream(csv_path, remove_keywords or []), desc='推理(流式CSV)', unit='行'):
-        try:
-            # 文件内按行分片（如启用）
-            if shard_within_file and world_size > 1:
-                if (line_index % world_size) != rank:
+    try:
+        # 逐行流式读取 CSV
+        line_index = 0
+        for rec in tqdm(pp_process_csv_file_stream(csv_path, remove_keywords or []), desc='推理(流式CSV)', unit='行'):
+            try:
+                # 文件内按行分片（如启用）
+                if shard_within_file and world_size > 1:
+                    if (line_index % world_size) != rank:
+                        line_index += 1
+                        continue
                     line_index += 1
+                text = rec.get('text') or ''
+                if not text:
                     continue
-                line_index += 1
-            text = rec.get('text') or ''
-            if not text:
+                ipc_code = pp_normalize_single_ipc(rec.get('ipc',''))
+                lab = 0
+                for pref in valid_norm:
+                    if ipc_code.startswith(pref):
+                        lab = 1
+                        break
+                buf_texts.append(text)
+                buf_labels.append(int(lab))
+                buf_ipc.append(ipc_code)
+            except Exception:
                 continue
-            ipc_code = pp_normalize_single_ipc(rec.get('ipc',''))
-            lab = 0
-            for pref in valid_norm:
-                if ipc_code.startswith(pref):
-                    lab = 1
-                    break
-            buf_texts.append(text)
-            buf_labels.append(int(lab))
-            buf_ipc.append(ipc_code)
-        except Exception:
-            continue
 
-    if len(buf_labels) >= batch_size:
+            if len(buf_labels) >= batch_size:
+                enc = tokenizer(buf_texts, truncation=True, max_length=max_length, padding=True, return_tensors='pt')
+                inputs = {k: v.to(device) for k,v in enc.items()}
+                with torch.no_grad():
+                    logits = model(**inputs).logits
+                    probs = torch.softmax(logits, dim=-1)
+                    cls = torch.argmax(probs, dim=-1)
+                preds_b = cls.cpu().tolist()
+                prob1_b = probs[:,1].cpu().tolist()
+                for j, pred in enumerate(preds_b):
+                    gt = buf_labels[j]
+                    if pred == 1 and gt == 1:
+                        tp += 1
+                    elif pred == 0 and gt == 0:
+                        tn += 1
+                    elif pred == 1 and gt == 0:
+                        fp += 1
+                    else:
+                        fn += 1
+                n_total += len(preds_b)
+                update_ipc(buf_ipc, buf_labels, preds_b)
+                if writer is not None:
+                    for j, pred in enumerate(preds_b):
+                        rec_out = {
+                            'index': idx + j,
+                            'pred': int(pred),
+                            'prob_valid': float(prob1_b[j]),
+                            'label': int(buf_labels[j]),
+                            'text': buf_texts[j],
+                            'ipc': buf_ipc[j],
+                        }
+                        writer.write(json.dumps(rec_out, ensure_ascii=False) + '\n')
+                idx += len(preds_b)
+                buf_texts.clear(); buf_labels.clear(); buf_ipc.clear()
+                if torch.cuda.is_available() and (idx // max(1, batch_size)) % 50 == 0:
+                    torch.cuda.empty_cache()
+
+        # 尾批
+        if buf_labels:
             enc = tokenizer(buf_texts, truncation=True, max_length=max_length, padding=True, return_tensors='pt')
             inputs = {k: v.to(device) for k,v in enc.items()}
             with torch.no_grad():
@@ -605,46 +684,23 @@ def evaluate_stream_csv(
                         'ipc': buf_ipc[j],
                     }
                     writer.write(json.dumps(rec_out, ensure_ascii=False) + '\n')
-            idx += len(preds_b)
-            buf_texts.clear(); buf_labels.clear(); buf_ipc.clear()
-            if torch.cuda.is_available() and (idx // max(1, batch_size)) % 50 == 0:
+            if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-
-    # 尾批
-    if buf_labels:
-        enc = tokenizer(buf_texts, truncation=True, max_length=max_length, padding=True, return_tensors='pt')
-        inputs = {k: v.to(device) for k,v in enc.items()}
-        with torch.no_grad():
-            logits = model(**inputs).logits
-            probs = torch.softmax(logits, dim=-1)
-            cls = torch.argmax(probs, dim=-1)
-        preds_b = cls.cpu().tolist()
-        prob1_b = probs[:,1].cpu().tolist()
-        for j, pred in enumerate(preds_b):
-            gt = buf_labels[j]
-            if pred == 1 and gt == 1:
-                tp += 1
-            elif pred == 0 and gt == 0:
-                tn += 1
-            elif pred == 1 and gt == 0:
-                fp += 1
-            else:
-                fn += 1
-        n_total += len(preds_b)
-        update_ipc(buf_ipc, buf_labels, preds_b)
+    finally:
         if writer is not None:
-            for j, pred in enumerate(preds_b):
-                rec_out = {
-                    'index': idx + j,
-                    'pred': int(pred),
-                    'prob_valid': float(prob1_b[j]),
-                    'label': int(buf_labels[j]),
-                    'text': buf_texts[j],
-                    'ipc': buf_ipc[j],
-                }
-                writer.write(json.dumps(rec_out, ensure_ascii=False) + '\n')
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            try:
+                writer.close()
+            except Exception:
+                pass
+        try:
+            del model
+        except Exception:
+            pass
+        try:
+            del tokenizer
+        except Exception:
+            pass
+        _cuda_cleanup()
 
     if writer is not None:
         writer.close()
@@ -718,7 +774,7 @@ def evaluate(model_dir: str,
 
     input_ids_list: List[List[int]] = []  # 为类型检查预先定义
     attn_list: List[List[int]] = []
-    ipc: List[str] | None = None
+    ipc: Optional[List[str]] = None
     if in_memory_texts is not None and in_memory_labels is not None:
         # 内存模式 (例如来自 CSV 直接预处理)
         if already_tokenized:
@@ -750,34 +806,47 @@ def evaluate(model_dir: str,
     prob_1: List[float] = []
     id2label = model.config.id2label or {0: 'false', 1: 'true'}
 
-    for start, end in tqdm(list(batch_iter(n, batch_size)), desc='推理'):
-        if already_tokenized:
-            batch_ids = input_ids_list[start:end]
-            batch_attn = attn_list[start:end]
-            max_len_batch = max(len(x) for x in batch_ids)
-            if max_len_batch > max_length:
-                max_len_batch = max_length
-            input_ids_tensor = torch.full((end-start, max_len_batch), tokenizer.pad_token_id or 0, dtype=torch.long)
-            attn_tensor = torch.zeros((end-start, max_len_batch), dtype=torch.long)
-            for i,(ids,attn) in enumerate(zip(batch_ids, batch_attn)):
-                ids = ids[:max_len_batch]
-                attn = attn[:max_len_batch]
-                input_ids_tensor[i,:len(ids)] = torch.tensor(ids, dtype=torch.long)
-                attn_tensor[i,:len(attn)] = torch.tensor(attn, dtype=torch.long)
-            inputs = {
-                'input_ids': input_ids_tensor.to(device),
-                'attention_mask': attn_tensor.to(device),
-            }
-        else:
-            batch_texts = texts[start:end]  # type: ignore
-            inputs = tokenizer(batch_texts, truncation=True, max_length=max_length, padding=True, return_tensors='pt')
-            inputs = {k: v.to(device) for k, v in inputs.items()}
-        with torch.no_grad():
-            logits = model(**inputs).logits
-            probs = torch.softmax(logits, dim=-1)
-            cls = torch.argmax(probs, dim=-1)
-        preds.extend(cls.cpu().tolist())
-        prob_1.extend(probs[:,1].cpu().tolist())
+    try:
+        for start, end in tqdm(list(batch_iter(n, batch_size)), desc='推理'):
+            if already_tokenized:
+                batch_ids = input_ids_list[start:end]
+                batch_attn = attn_list[start:end]
+                max_len_batch = max(len(x) for x in batch_ids) if batch_ids else 1
+                if max_len_batch > max_length:
+                    max_len_batch = max_length
+                input_ids_tensor = torch.full((end-start, max_len_batch), tokenizer.pad_token_id or 0, dtype=torch.long)
+                attn_tensor = torch.zeros((end-start, max_len_batch), dtype=torch.long)
+                for i, (ids, attn) in enumerate(zip(batch_ids, batch_attn)):
+                    ids = ids[:max_len_batch]
+                    attn = attn[:max_len_batch]
+                    input_ids_tensor[i, :len(ids)] = torch.tensor(ids, dtype=torch.long)
+                    attn_tensor[i, :len(attn)] = torch.tensor(attn, dtype=torch.long)
+                inputs = {
+                    'input_ids': input_ids_tensor.to(device),
+                    'attention_mask': attn_tensor.to(device),
+                }
+            else:
+                batch_texts = texts[start:end]  # type: ignore
+                enc = tokenizer(batch_texts, truncation=True, max_length=max_length, padding=True, return_tensors='pt')
+                inputs = {k: v.to(device) for k, v in enc.items()}
+            with torch.no_grad():
+                logits = model(**inputs).logits
+                probs = torch.softmax(logits, dim=-1)
+                cls = torch.argmax(probs, dim=-1)
+            preds.extend(cls.cpu().tolist())
+            prob_1.extend(probs[:, 1].cpu().tolist())
+            if torch.cuda.is_available() and ((end // max(1, batch_size)) % 50 == 0):
+                torch.cuda.empty_cache()
+    finally:
+        try:
+            del model
+        except Exception:
+            pass
+        try:
+            del tokenizer
+        except Exception:
+            pass
+        _cuda_cleanup()
 
     # Metrics
     import numpy as np
@@ -785,14 +854,14 @@ def evaluate(model_dir: str,
     preds_arr = np.array(preds)
     accuracy = float((labels_arr == preds_arr).mean())
     precision, recall, f1, _ = precision_recall_fscore_support(labels_arr, preds_arr, average='binary', zero_division=0)
-    cm = confusion_matrix(labels_arr, preds_arr, labels=[0,1])
+    cm = confusion_matrix(labels_arr, preds_arr, labels=[0, 1])
     if cm.size == 4:
         tn, fp, fn, tp = cm.ravel()
     else:
-        tn=fp=fn=tp=0
+        tn = fp = fn = tp = 0
     eval_res = EvalResult(accuracy, float(precision), float(recall), float(f1), int(tp), int(tn), int(fp), int(fn), int(len(labels)))
 
-    report = classification_report(labels_arr, preds_arr, target_names=[id2label.get(0,'0'), id2label.get(1,'1')], zero_division=0)
+    report = classification_report(labels_arr, preds_arr, target_names=[id2label.get(0, '0'), id2label.get(1, '1')], zero_division=0)
 
     # 确保所有输出值为原生 Python 类型 (避免 numpy.int64/json 序列化报错)
     metrics_dict = eval_res.to_dict()
@@ -805,7 +874,7 @@ def evaluate(model_dir: str,
             key = ipc_val or ''
             a = agg.get(key)
             if a is None:
-                a = {'total':0,'label_pos':0,'pred_pos':0,'correct':0,'tp_pos':0}
+                a = {'total': 0, 'label_pos': 0, 'pred_pos': 0, 'correct': 0, 'tp_pos': 0}
                 agg[key] = a
             a['total'] += 1
             lab = labels[i]
@@ -821,13 +890,13 @@ def evaluate(model_dir: str,
         # 计算派生指标
         for k, a in agg.items():
             total_k = a['total']
-            prec = a['tp_pos']/a['pred_pos'] if a['pred_pos'] else 0.0
-            rec = a['tp_pos']/a['label_pos'] if a['label_pos'] else 0.0
-            f1_k = (2*prec*rec/(prec+rec)) if (prec+rec)>0 else 0.0
+            prec = a['tp_pos'] / a['pred_pos'] if a['pred_pos'] else 0.0
+            rec = a['tp_pos'] / a['label_pos'] if a['label_pos'] else 0.0
+            f1_k = (2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
             ipc_stats.append({
                 'ipc': k,
                 'total': total_k,
-                'accuracy': a['correct']/total_k if total_k else 0.0,
+                'accuracy': a['correct'] / total_k if total_k else 0.0,
                 'label_pos': a['label_pos'],
                 'pred_pos': a['pred_pos'],
                 'tp_pos': a['tp_pos'],
@@ -856,7 +925,7 @@ def evaluate(model_dir: str,
 
     if save_predictions:
         with open(save_predictions, 'w', encoding='utf-8') as f:
-            for i,(pred, prob) in enumerate(zip(preds, prob_1)):
+            for i, (pred, prob) in enumerate(zip(preds, prob_1)):
                 rec = {
                     'index': i,
                     'pred': int(pred),
@@ -865,7 +934,7 @@ def evaluate(model_dir: str,
                 }
                 if not already_tokenized and texts is not None:
                     rec['text'] = texts[i]
-                if ipc is not None and len(ipc)==n:
+                if ipc is not None and len(ipc) == n:
                     rec['ipc'] = ipc[i]
                 f.write(json.dumps(rec, ensure_ascii=False) + '\n')
         print(f'[输出] 预测写入 {save_predictions}')
@@ -1452,4 +1521,13 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    finally:
+        # 进程退出前做一次全局清理；分布式则销毁进程组
+        _cuda_cleanup()
+        try:
+            if dist.is_available() and dist.is_initialized():
+                dist.destroy_process_group()
+        except Exception:
+            pass
