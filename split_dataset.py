@@ -1,4 +1,4 @@
-import json, os, sys, math, random, collections, argparse, threading
+import json, os, sys, math, random, collections, argparse, threading, gc
 from queue import Queue
 from typing import List, Dict, Any, Tuple
 from tqdm import tqdm
@@ -78,6 +78,7 @@ def stream_split_balance_binary(
     label_key: str,
     limit: int | None,
     meta_counts: Dict[str, int] | None = None,
+    queue_size: int = 1000,
 ):
     """两遍扫描的流式平衡+分层划分：
     1) 遍历统计总行数与二分类计数。
@@ -117,7 +118,7 @@ def stream_split_balance_binary(
     seen = {0: 0, 1: 0}
     with open(input_path, "r", encoding="utf-8") as f:
         pbar = tqdm(total=total_lines, desc="采样", unit="行")
-        for line in f:
+        for i_line, line in enumerate(f):
             pbar.update(1)
             try:
                 r = json.loads(line)
@@ -134,7 +135,12 @@ def stream_split_balance_binary(
                 j = rng.randint(0, seen[cls] - 1)
                 if j < min_count:
                     res[j] = r
+            # 周期触发一次垃圾回收
+            if (i_line % 200000) == 0:
+                gc.collect()
         pbar.close()
+    # 采样阶段结束，做一次显式回收
+    gc.collect()
 
     # 分层按比例切分
     def split_one(lst: List[Dict[str, Any]]):
@@ -147,19 +153,17 @@ def stream_split_balance_binary(
 
     t0, v0, te0 = split_one(reservoir[0])
     t1, v1, te1 = split_one(reservoir[1])
-    train = t0 + t1
-    rng.shuffle(train)
-    val = v0 + v1
-    rng.shuffle(val)
-    test = te0 + te1
-    rng.shuffle(test)
+    # 不再合并成大列表，避免额外内存；分别就地乱序后分阶段写出
+    rng.shuffle(t0); rng.shuffle(t1)
+    rng.shuffle(v0); rng.shuffle(v1)
+    rng.shuffle(te0); rng.shuffle(te1)
 
     # 异步写入
     os.makedirs(outdir, exist_ok=True)
     train_path = os.path.join(outdir, "train.jsonl")
     val_path = os.path.join(outdir, "val.jsonl")
     test_path = os.path.join(outdir, "test.jsonl")
-    tq, vq, eq = Queue(maxsize=10000), Queue(maxsize=10000), Queue(maxsize=10000)
+    tq, vq, eq = Queue(maxsize=max(10, queue_size)), Queue(maxsize=max(10, queue_size)), Queue(maxsize=max(10, queue_size))
     tt = threading.Thread(target=_writer_worker, args=(train_path, tq), daemon=True)
     vt = threading.Thread(target=_writer_worker, args=(val_path, vq), daemon=True)
     et = threading.Thread(target=_writer_worker, args=(test_path, eq), daemon=True)
@@ -167,17 +171,33 @@ def stream_split_balance_binary(
     vt.start()
     et.start()
 
-    total_write = len(train) + len(val) + len(test)
+    total_write = len(t0) + len(t1) + len(v0) + len(v1) + len(te0) + len(te1)
     pbar_w = tqdm(total=total_write, desc="写出", unit="条")
-    for r in train:
+    # 分阶段写出，且在阶段间回收内存
+    for r in t0:
         tq.put(json.dumps(r, ensure_ascii=False) + "\n")
         pbar_w.update(1)
-    for r in val:
+    t0.clear(); gc.collect()
+    for r in t1:
+        tq.put(json.dumps(r, ensure_ascii=False) + "\n")
+        pbar_w.update(1)
+    t1.clear(); gc.collect()
+    for r in v0:
         vq.put(json.dumps(r, ensure_ascii=False) + "\n")
         pbar_w.update(1)
-    for r in test:
+    v0.clear(); gc.collect()
+    for r in v1:
+        vq.put(json.dumps(r, ensure_ascii=False) + "\n")
+        pbar_w.update(1)
+    v1.clear(); gc.collect()
+    for r in te0:
         eq.put(json.dumps(r, ensure_ascii=False) + "\n")
         pbar_w.update(1)
+    te0.clear(); gc.collect()
+    for r in te1:
+        eq.put(json.dumps(r, ensure_ascii=False) + "\n")
+        pbar_w.update(1)
+    te1.clear(); gc.collect()
     pbar_w.close()
 
     # 结束与同步
@@ -186,7 +206,8 @@ def stream_split_balance_binary(
     for t in (tt, vt, et):
         t.join()
 
-    return len(train), len(val), len(test)
+    # 返回各 split 样本数（与写出一致）
+    return (len(t0) + len(t1)), (len(v0) + len(v1)), (len(te0) + len(te1))
 
 
 def stratified_split_balance_binary(
@@ -407,11 +428,13 @@ def main():
         meta.setdefault("splits", {})
         meta.setdefault("split_paths", {})
         meta["splits"].update(sizes)
-        meta["split_paths"].update({
-            "train": train_path,
-            "val": val_path,
-            "test": test_path,
-        })
+        meta["split_paths"].update(
+            {
+                "train": train_path,
+                "val": val_path,
+                "test": test_path,
+            }
+        )
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
         print(f"已更新元数据: {meta_path}")
