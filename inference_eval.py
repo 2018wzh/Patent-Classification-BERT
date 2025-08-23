@@ -265,6 +265,7 @@ def evaluate_stream(
     input: str,
     batch_size: int,
     max_length: int,
+    threshold: float,
     already_tokenized: bool,
     text_key: str,
     label_key: str,
@@ -381,9 +382,9 @@ def evaluate_stream(
                     with torch.no_grad():
                         logits = model(**inputs).logits
                         probs = torch.softmax(logits, dim=-1)
-                        cls = torch.argmax(probs, dim=-1)
-                    preds_b = cls.cpu().tolist()
-                    prob1_b = probs[:,1].cpu().tolist()
+                    # 阈值判定
+                    prob1_b = probs[:,1].detach().cpu().tolist()
+                    preds_b = [1 if p > threshold else 0 for p in prob1_b]
                     # 更新指标
                     for j, pred in enumerate(preds_b):
                         gt = buf_labels[j]
@@ -436,9 +437,8 @@ def evaluate_stream(
                 with torch.no_grad():
                     logits = model(**inputs).logits
                     probs = torch.softmax(logits, dim=-1)
-                    cls = torch.argmax(probs, dim=-1)
-                preds_b = cls.cpu().tolist()
-                prob1_b = probs[:,1].cpu().tolist()
+                prob1_b = probs[:,1].detach().cpu().tolist()
+                preds_b = [1 if p > threshold else 0 for p in prob1_b]
                 for j, pred in enumerate(preds_b):
                     gt = buf_labels[j]
                     if pred == 1 and gt == 1:
@@ -524,6 +524,7 @@ def evaluate_stream(
         'input': str(input),
         'already_tokenized': bool(already_tokenized),
         'max_length': int(max_length),
+    'threshold': float(threshold),
         'ipc_stats': ipc_stats,
     }
     return out
@@ -534,6 +535,7 @@ def evaluate_stream_csv(
     csv_path: str,
     batch_size: int,
     max_length: int,
+    threshold: float,
     text_key: str,
     label_key: str,
     save_predictions: Optional[str] = None,
@@ -620,9 +622,8 @@ def evaluate_stream_csv(
                 with torch.no_grad():
                     logits = model(**inputs).logits
                     probs = torch.softmax(logits, dim=-1)
-                    cls = torch.argmax(probs, dim=-1)
-                preds_b = cls.cpu().tolist()
-                prob1_b = probs[:,1].cpu().tolist()
+                prob1_b = probs[:,1].detach().cpu().tolist()
+                preds_b = [1 if p > threshold else 0 for p in prob1_b]
                 for j, pred in enumerate(preds_b):
                     gt = buf_labels[j]
                     if pred == 1 and gt == 1:
@@ -658,9 +659,8 @@ def evaluate_stream_csv(
             with torch.no_grad():
                 logits = model(**inputs).logits
                 probs = torch.softmax(logits, dim=-1)
-                cls = torch.argmax(probs, dim=-1)
-            preds_b = cls.cpu().tolist()
-            prob1_b = probs[:,1].cpu().tolist()
+            prob1_b = probs[:,1].detach().cpu().tolist()
+            preds_b = [1 if p > threshold else 0 for p in prob1_b]
             for j, pred in enumerate(preds_b):
                 gt = buf_labels[j]
                 if pred == 1 and gt == 1:
@@ -746,6 +746,7 @@ def evaluate_stream_csv(
         'input': str(csv_path),
         'already_tokenized': False,
         'max_length': int(max_length),
+    'threshold': float(threshold),
         'ipc_stats': ipc_stats,
     }
     return out
@@ -755,6 +756,7 @@ def evaluate(model_dir: str,
              input: Optional[str],
              batch_size: int,
              max_length: int,
+             threshold: float,
              already_tokenized: bool,
              text_key: str,
              label_key: str,
@@ -832,9 +834,10 @@ def evaluate(model_dir: str,
             with torch.no_grad():
                 logits = model(**inputs).logits
                 probs = torch.softmax(logits, dim=-1)
-                cls = torch.argmax(probs, dim=-1)
-            preds.extend(cls.cpu().tolist())
-            prob_1.extend(probs[:, 1].cpu().tolist())
+            p1 = probs[:, 1].detach().cpu()
+            pred_b = (p1 > threshold).to(torch.int64).tolist()
+            preds.extend(pred_b)
+            prob_1.extend(p1.tolist())
             if torch.cuda.is_available() and ((end // max(1, batch_size)) % 50 == 0):
                 torch.cuda.empty_cache()
     finally:
@@ -920,6 +923,7 @@ def evaluate(model_dir: str,
         'input': str(input) if input else 'in-memory',
         'already_tokenized': bool(already_tokenized),
         'max_length': int(max_length),
+    'threshold': float(threshold),
         'ipc_stats': ipc_stats,
     }
 
@@ -1154,6 +1158,7 @@ def main():
     parser.add_argument('--label-key', default='label')
     parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--max-length', type=int, default=512)
+    parser.add_argument('--threshold', type=float, default=0.5, help='正类判定阈值，prob(1) > threshold 判为 1')
     parser.add_argument('--save-predictions', default="outputs/prediction.jsonl", help='保存逐样本预测 jsonl')
     parser.add_argument('--metrics-output', default="outputs/metrics.json", help='保存指标 json')
     parser.add_argument('--gpus', default=None, help='指定可见 GPU (如 "0" 或 "0,1")')
@@ -1230,6 +1235,7 @@ def main():
                     csv_path=i_path,
                     batch_size=args.batch_size,
                     max_length=args.max_length,
+                    threshold=args.threshold,
                     text_key=args.text_key,
                     label_key=args.label_key,
                     save_predictions=pred_path,
@@ -1277,6 +1283,7 @@ def main():
                     input=None,
                     batch_size=args.batch_size,
                     max_length=args.max_length,
+                    threshold=args.threshold,
                     already_tokenized=False,
                     text_key=args.text_key,
                     label_key=args.label_key,
@@ -1294,6 +1301,7 @@ def main():
                     input=i_path,
                     batch_size=args.batch_size,
                     max_length=args.max_length,
+                    threshold=args.threshold,
                     already_tokenized=args.already_tokenized,
                     text_key=args.text_key,
                     label_key=args.label_key,
@@ -1309,6 +1317,7 @@ def main():
                     input=i_path,
                     batch_size=args.batch_size,
                     max_length=args.max_length,
+                    threshold=args.threshold,
                     already_tokenized=args.already_tokenized,
                     text_key=args.text_key,
                     label_key=args.label_key,
