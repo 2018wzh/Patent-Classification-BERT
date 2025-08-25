@@ -228,7 +228,7 @@ def unify_record(
     parts = [patent_name, abstract, claims]
     text = "\n".join([p for p in parts if p])
 
-    grant_no = row.get("授权公告号", "").strip()
+    grant_no = row.get("公开公告号", "").strip()
     return {
         "id": grant_no,
         "text": text,
