@@ -59,6 +59,7 @@ def load_tokenized_file(path: str, label_key: str = 'label', ipc_key: str = 'ipc
     attention_list: List[List[int]] = []
     labels: List[int] = []
     ipc: List[str] = []
+    ids: List[Any] = []
     if path.endswith('.jsonl'):
         with open(path, 'r', encoding='utf-8') as f:
             for line in f:
@@ -76,6 +77,7 @@ def load_tokenized_file(path: str, label_key: str = 'label', ipc_key: str = 'ipc
                     lab_val = 0
                 labels.append(int(lab_val))
                 ipc.append(obj.get(ipc_key, ''))
+                ids.append(obj.get('id'))
     elif path.endswith('.json'):
         with open(path, 'r', encoding='utf-8') as f:
             root = json.load(f)
@@ -93,9 +95,10 @@ def load_tokenized_file(path: str, label_key: str = 'label', ipc_key: str = 'ipc
                 lab_val = 0
             labels.append(int(lab_val))
             ipc.append(obj.get(ipc_key, ''))
+            ids.append(obj.get('id'))
     else:
         raise ValueError('只支持 .jsonl 或 .json 输入')
-    return {'input_ids': input_ids_list, 'attention_mask': attention_list, 'labels': labels, 'ipc': ipc}
+    return {'input_ids': input_ids_list, 'attention_mask': attention_list, 'labels': labels, 'ipc': ipc, 'ids': ids}
 
 
 def load_text_file(path: str, text_key: str = 'text', label_key: str = 'label', ipc_key: str = 'ipc') -> Dict[str, List[Any]]:
@@ -103,6 +106,7 @@ def load_text_file(path: str, text_key: str = 'text', label_key: str = 'label', 
     texts: List[str] = []
     labels: List[int] = []
     ipc: List[str] = []
+    ids: List[Any] = []
     if path.endswith('.jsonl'):
         with open(path, 'r', encoding='utf-8') as f:
             for line in f:
@@ -122,6 +126,7 @@ def load_text_file(path: str, text_key: str = 'text', label_key: str = 'label', 
                 texts.append(text)
                 labels.append(int(lab_val))
                 ipc.append(obj.get(ipc_key, ''))
+                ids.append(obj.get('id'))
     elif path.endswith('.json'):
         with open(path, 'r', encoding='utf-8') as f:
             root = json.load(f)
@@ -141,9 +146,10 @@ def load_text_file(path: str, text_key: str = 'text', label_key: str = 'label', 
             texts.append(text)
             labels.append(int(lab_val))
             ipc.append(obj.get(ipc_key, ''))
+            ids.append(obj.get('id'))
     else:
         raise ValueError('只支持 .jsonl 或 .json 输入')
-    return {'texts': texts, 'labels': labels, 'ipc': ipc}
+    return {'texts': texts, 'labels': labels, 'ipc': ipc, 'ids': ids}
 
 
 def batch_iter(seq_len: int, batch_size: int):
@@ -342,6 +348,7 @@ def evaluate_stream(
             buf_texts: List[str] = []
             buf_labels: List[int] = []
             buf_ipc: List[str] = []
+            buf_rec_ids: List[Any] = []
             idx = 0
             line_index = 0
             batch_counter = 0
@@ -369,9 +376,9 @@ def evaluate_stream(
                 buf_labels.append(lab)
                 buf_ipc.append(obj.get(ipc_key, ''))
                 if already_tokenized:
-                    ids = obj.get('input_ids') or []
-                    attn = obj.get('attention_mask') or [1]*len(ids)
-                    buf_ids.append(ids)
+                    ids_token = obj.get('input_ids') or []
+                    attn = obj.get('attention_mask') or [1]*len(ids_token)
+                    buf_ids.append(ids_token)
                     buf_attn.append(attn)
                 else:
                     text = obj.get(text_key)
@@ -380,6 +387,8 @@ def evaluate_stream(
                         buf_labels.pop(); buf_ipc.pop()
                         continue
                     buf_texts.append(text)
+                # 记录该样本的原始 id（如存在）
+                buf_rec_ids.append(obj.get('id'))
 
                 if len(buf_labels) >= batch_size:
                     # 处理一个批
@@ -429,10 +438,12 @@ def evaluate_stream(
                                 rec['ipc'] = buf_ipc[j]
                             if source_name:
                                 rec['source'] = source_name
+                            if len(buf_rec_ids) > j and buf_rec_ids[j] is not None:
+                                rec['id'] = buf_rec_ids[j]
                             writer.write(json.dumps(rec, ensure_ascii=False) + '\n')
                     idx += len(preds_b)
                     # 清空批
-                    buf_ids.clear(); buf_attn.clear(); buf_texts.clear(); buf_labels.clear(); buf_ipc.clear()
+                    buf_ids.clear(); buf_attn.clear(); buf_texts.clear(); buf_labels.clear(); buf_ipc.clear(); buf_rec_ids.clear()
                     batch_counter += 1
                     if torch.cuda.is_available() and (batch_counter % 50 == 0):
                         # 周期性释放缓存显存，避免峰值堆积
@@ -484,6 +495,8 @@ def evaluate_stream(
                             rec['ipc'] = buf_ipc[j]
                         if source_name:
                             rec['source'] = source_name
+                        if len(buf_rec_ids) > j and buf_rec_ids[j] is not None:
+                            rec['id'] = buf_rec_ids[j]
                         writer.write(json.dumps(rec, ensure_ascii=False) + '\n')
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -814,6 +827,7 @@ def evaluate(model_dir: str,
     input_ids_list: List[List[int]] = []  # 为类型检查预先定义
     attn_list: List[List[int]] = []
     ipc: Optional[List[str]] = None
+    ids_list: Optional[List[Any]] = None
     if in_memory_texts is not None and in_memory_labels is not None:
         # 内存模式 (例如来自 CSV 直接预处理)
         if already_tokenized:
@@ -831,12 +845,14 @@ def evaluate(model_dir: str,
             attn_list = bundle['attention_mask']
             labels = bundle['labels']
             ipc = bundle.get('ipc')
+            ids_list = bundle.get('ids')
             texts = None
         else:
             data = load_text_file(input, text_key=text_key, label_key=label_key, ipc_key=ipc_key)
             texts = data['texts']
             labels = data['labels']
             ipc = data.get('ipc')
+            ids_list = data.get('ids')
 
     n = len(labels)
     print(f'[加载] 样本数: {n}  已分词: {already_tokenized}')
@@ -986,6 +1002,8 @@ def evaluate(model_dir: str,
                     rec['ipc'] = ipc[i]
                 if source_name:
                     rec['source'] = source_name
+                if ids_list is not None and len(ids_list) == n:
+                    rec['id'] = ids_list[i]
                 f.write(json.dumps(rec, ensure_ascii=False) + '\n')
         finally:
             if local_opened and f is not None:
@@ -1201,6 +1219,69 @@ def _merge_prediction_files(pred_paths: List[Tuple[str, str]], out_path: str, de
                     os.remove(p)
             except Exception:
                 pass
+
+
+def _ipc_stats_from_predictions(pred_path: str) -> List[Dict[str, Any]]:
+    """从合并后的 predictions.jsonl 计算 IPC 统计。
+    返回列表元素结构与 evaluate/evaluate_stream 的 ipc_stats 一致。
+    """
+    agg: Dict[str, Dict[str, int]] = {}
+    if not pred_path or not os.path.exists(pred_path):
+        return []
+    try:
+        with open(pred_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                try:
+                    lab = int(obj.get('label', 0))
+                except Exception:
+                    continue
+                try:
+                    pred = int(obj.get('pred', 0))
+                except Exception:
+                    pred = 0
+                ipc = obj.get('ipc') or ''
+                a = agg.get(ipc)
+                if a is None:
+                    a = {'total':0,'label_pos':0,'pred_pos':0,'correct':0,'tp_pos':0}
+                    agg[ipc] = a
+                a['total'] += 1
+                if lab == 1:
+                    a['label_pos'] += 1
+                if pred == 1:
+                    a['pred_pos'] += 1
+                if pred == lab:
+                    a['correct'] += 1
+                if pred == 1 and lab == 1:
+                    a['tp_pos'] += 1
+    except Exception:
+        return []
+
+    ipc_stats: List[Dict[str, Any]] = []
+    for k, a in agg.items():
+        total_k = a['total']
+        prec_k = a['tp_pos']/a['pred_pos'] if a['pred_pos'] else 0.0
+        rec_k = a['tp_pos']/a['label_pos'] if a['label_pos'] else 0.0
+        f1_k = (2*prec_k*rec_k/(prec_k+rec_k)) if (prec_k+rec_k)>0 else 0.0
+        ipc_stats.append({
+            'ipc': k,
+            'total': total_k,
+            'accuracy': a['correct']/total_k if total_k else 0.0,
+            'label_pos': a['label_pos'],
+            'pred_pos': a['pred_pos'],
+            'tp_pos': a['tp_pos'],
+            'precision_pos': prec_k,
+            'recall_pos': rec_k,
+            'f1_pos': f1_k,
+        })
+    ipc_stats.sort(key=lambda x: x['total'], reverse=True)
+    return ipc_stats
 
 
 def main():
@@ -1494,8 +1575,6 @@ def main():
             dist.barrier()
         except Exception:
             pass
-        if rank == 0:
-            pass
         # 先进行全局指标求和
         try:
             dev = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
@@ -1506,7 +1585,26 @@ def main():
             # 回退：使用本地（不准确）
             g_tn, g_fp, g_fn, g_tp, g_samples = agg_tn, agg_fp, agg_fn, agg_tp, agg_samples
         if rank == 0:
-            # 计算全局指标并写出
+            # 合并各 rank 的预测 -> 生成全量 predictions.jsonl
+            merged_pred_path = args.save_predictions if args.save_predictions else None
+            if merged_pred_path:
+                base = merged_pred_path
+                d = os.path.dirname(base)
+                n, ext = os.path.splitext(os.path.basename(base))
+                parts = []
+                for r in range(world_size):
+                    p = os.path.join(d, f"{n}__rank{r}{ext}")
+                    if os.path.exists(p):
+                        parts.append((f"rank{r}", p))
+                if parts:
+                    _merge_prediction_files(parts, base, delete_sources=True)
+
+            # 基于合并后的预测重建 IPC 统计
+            ipc_stats_final: List[Dict[str, Any]] = []
+            if merged_pred_path and os.path.exists(merged_pred_path):
+                ipc_stats_final = _ipc_stats_from_predictions(merged_pred_path)
+
+            # 计算全局指标并写出（包含 IPC 统计）
             accG = (g_tp + g_tn) / max(1, (g_tp+g_tn+g_fp+g_fn))
             precG = g_tp / max(1, (g_tp+g_fp))
             recG = g_tp / max(1, (g_tp+g_fn))
@@ -1522,27 +1620,13 @@ def main():
                     'already_tokenized': bool(args.already_tokenized),
                     'max_length': int(args.max_length),
                     'threshold': float(args.threshold),
-                    # 为避免对象通信，分布式下省略 IPC 细分（可通过读取合并后的预测文件再生成）
-                    'ipc_stats': [],
+                    'ipc_stats': ipc_stats_final,
                 },
                 ipc_top_k=args.ipc_top_k,
                 ipc_min_total=args.ipc_min_total,
                 ipc_summary_text_path=args.ipc_summary_text,
                 metrics_output_path=args.metrics_output,
             )
-
-            # 合并各 rank 的预测
-            if args.save_predictions:
-                base = args.save_predictions
-                d = os.path.dirname(base)
-                n, ext = os.path.splitext(os.path.basename(base))
-                parts = []
-                for r in range(world_size):
-                    p = os.path.join(d, f"{n}__rank{r}{ext}")
-                    if os.path.exists(p):
-                        parts.append((f"rank{r}", p))
-                if parts:
-                    _merge_prediction_files(parts, base, delete_sources=True)
         # 关闭共享 writer（分布式不使用，共享则在非分布式下）
         if shared_pred_writer is not None:
             try:
