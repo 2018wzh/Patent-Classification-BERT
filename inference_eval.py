@@ -284,6 +284,9 @@ def evaluate_stream(
     shard_within_file: bool = False,
     rank: int = 0,
     world_size: int = 1,
+    shared_writer: Optional[Any] = None,
+    source_name: Optional[str] = None,
+    index_offset: int = 0,
 ) -> Dict[str, Any]:
     """流式评估：一边读取一边(可选分词)一边推理，并增量写出预测与累计指标。仅支持 .jsonl。"""
     if not input.lower().endswith('.jsonl'):
@@ -303,7 +306,11 @@ def evaluate_stream(
     preds_tmp: List[int] = []
     labels_tmp: List[int] = []
     ipc_agg: Dict[str, Dict[str, int]] = {}
-    writer = open(save_predictions, 'w', encoding='utf-8') if save_predictions else None
+    local_opened = False
+    writer = shared_writer
+    if writer is None and save_predictions:
+        writer = open(save_predictions, 'w', encoding='utf-8')
+        local_opened = True
 
     def update_ipc(ipc_list: List[str], labels_b: List[int], preds_b: List[int]):
         if not ipc_list:
@@ -411,7 +418,7 @@ def evaluate_stream(
                     if writer is not None:
                         for j, pred in enumerate(preds_b):
                             rec = {
-                                'index': idx + j,
+                                'index': index_offset + idx + j,
                                 'pred': int(pred),
                                 'prob_valid': float(prob1_b[j]),
                                 'label': int(buf_labels[j])
@@ -420,6 +427,8 @@ def evaluate_stream(
                                 rec['text'] = buf_texts[j]
                             if buf_ipc:
                                 rec['ipc'] = buf_ipc[j]
+                            if source_name:
+                                rec['source'] = source_name
                             writer.write(json.dumps(rec, ensure_ascii=False) + '\n')
                     idx += len(preds_b)
                     # 清空批
@@ -464,7 +473,7 @@ def evaluate_stream(
                 if writer is not None:
                     for j, pred in enumerate(preds_b):
                         rec = {
-                            'index': idx + j,
+                            'index': index_offset + idx + j,
                             'pred': int(pred),
                             'prob_valid': float(prob1_b[j]),
                             'label': int(buf_labels[j])
@@ -473,12 +482,14 @@ def evaluate_stream(
                             rec['text'] = buf_texts[j]
                         if buf_ipc:
                             rec['ipc'] = buf_ipc[j]
+                        if source_name:
+                            rec['source'] = source_name
                         writer.write(json.dumps(rec, ensure_ascii=False) + '\n')
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 # 无需清空，循环结束
     finally:
-        if writer is not None:
+        if local_opened and writer is not None:
             try:
                 writer.close()
             except Exception:
@@ -536,6 +547,7 @@ def evaluate_stream(
         'max_length': int(max_length),
     'threshold': float(threshold),
         'ipc_stats': ipc_stats,
+    'predictions_written': int(n_total),
     }
     return out
 
@@ -555,6 +567,9 @@ def evaluate_stream_csv(
     shard_within_file: bool = False,
     rank: int = 0,
     world_size: int = 1,
+    shared_writer: Optional[Any] = None,
+    source_name: Optional[str] = None,
+    index_offset: int = 0,
 ) -> Dict[str, Any]:
     """CSV 流式评估：逐行读取 CSV -> 统一结构 -> IPC 前缀匹配打标 -> 批量分词 -> 推理 -> 增量写出/累计指标。"""
     if pp_process_csv_file_stream is None or pp_normalize_single_ipc is None:
@@ -567,7 +582,11 @@ def evaluate_stream_csv(
     model.eval()
 
     valid_norm = sorted({pp_normalize_single_ipc(v) for v in (valid_labels_cfg or []) if v}, key=lambda x: (-len(x), x))
-    writer = open(save_predictions, 'w', encoding='utf-8') if save_predictions else None
+    local_opened = False
+    writer = shared_writer
+    if writer is None and save_predictions:
+        writer = open(save_predictions, 'w', encoding='utf-8')
+        local_opened = True
 
     tp=tn=fp=fn=0
     n_total = 0
@@ -649,13 +668,15 @@ def evaluate_stream_csv(
                 if writer is not None:
                     for j, pred in enumerate(preds_b):
                         rec_out = {
-                            'index': idx + j,
+                            'index': index_offset + idx + j,
                             'pred': int(pred),
                             'prob_valid': float(prob1_b[j]),
                             'label': int(buf_labels[j]),
                             'text': buf_texts[j],
                             'ipc': buf_ipc[j],
                         }
+                        if source_name:
+                            rec_out['source'] = source_name
                         writer.write(json.dumps(rec_out, ensure_ascii=False) + '\n')
                 idx += len(preds_b)
                 buf_texts.clear(); buf_labels.clear(); buf_ipc.clear()
@@ -686,18 +707,20 @@ def evaluate_stream_csv(
             if writer is not None:
                 for j, pred in enumerate(preds_b):
                     rec_out = {
-                        'index': idx + j,
+                        'index': index_offset + idx + j,
                         'pred': int(pred),
                         'prob_valid': float(prob1_b[j]),
                         'label': int(buf_labels[j]),
                         'text': buf_texts[j],
                         'ipc': buf_ipc[j],
                     }
+                    if source_name:
+                        rec_out['source'] = source_name
                     writer.write(json.dumps(rec_out, ensure_ascii=False) + '\n')
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
     finally:
-        if writer is not None:
+        if local_opened and writer is not None:
             try:
                 writer.close()
             except Exception:
@@ -712,7 +735,7 @@ def evaluate_stream_csv(
             pass
         _cuda_cleanup()
 
-    if writer is not None:
+    if local_opened and writer is not None:
         writer.close()
 
     # 汇总
@@ -758,6 +781,7 @@ def evaluate_stream_csv(
         'max_length': int(max_length),
     'threshold': float(threshold),
         'ipc_stats': ipc_stats,
+    'predictions_written': int(n_total),
     }
     return out
 
@@ -775,6 +799,9 @@ def evaluate(model_dir: str,
              in_memory_labels: Optional[List[int]] = None,
              ipc_key: str = 'ipc',
              in_memory_ipcs: Optional[List[str]] = None,
+             shared_writer: Optional[Any] = None,
+             source_name: Optional[str] = None,
+             index_offset: int = 0,
              ) -> Dict[str, Any]:
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     tokenizer = BertTokenizer.from_pretrained(model_dir, use_fast=True)
@@ -933,15 +960,22 @@ def evaluate(model_dir: str,
         'input': str(input) if input else 'in-memory',
         'already_tokenized': bool(already_tokenized),
         'max_length': int(max_length),
-    'threshold': float(threshold),
+        'threshold': float(threshold),
         'ipc_stats': ipc_stats,
+        'predictions_written': int(n),
     }
-
-    if save_predictions:
-        with open(save_predictions, 'w', encoding='utf-8') as f:
+    # 写预测：共享 writer 优先，否则写入到 save_predictions
+    if shared_writer is not None or save_predictions:
+        local_opened = False
+        f = shared_writer
+        if f is None and save_predictions:
+            f = open(save_predictions, 'w', encoding='utf-8')
+            local_opened = True
+        try:
+            assert f is not None
             for i, (pred, prob) in enumerate(zip(preds, prob_1)):
                 rec = {
-                    'index': i,
+                    'index': index_offset + i,
                     'pred': int(pred),
                     'prob_valid': float(prob),
                     'label': int(labels[i])
@@ -950,8 +984,12 @@ def evaluate(model_dir: str,
                     rec['text'] = texts[i]
                 if ipc is not None and len(ipc) == n:
                     rec['ipc'] = ipc[i]
+                if source_name:
+                    rec['source'] = source_name
                 f.write(json.dumps(rec, ensure_ascii=False) + '\n')
-        print(f'[输出] 预测写入 {save_predictions}')
+        finally:
+            if local_opened and f is not None:
+                f.close()
     return out
 
 
@@ -1134,7 +1172,7 @@ def _expand_inputs(pattern: str) -> List[str]:
     return []
 
 
-def _merge_prediction_files(pred_paths: List[Tuple[str, str]], out_path: str):
+def _merge_prediction_files(pred_paths: List[Tuple[str, str]], out_path: str, delete_sources: bool = False):
     """将多个预测 jsonl 合并为一个，添加 source 字段标识来源文件。
     pred_paths: 列表 (source_name, file_path)
     """
@@ -1156,6 +1194,13 @@ def _merge_prediction_files(pred_paths: List[Tuple[str, str]], out_path: str):
                         continue
                     obj['source'] = source_name
                     fout.write(json.dumps(obj, ensure_ascii=False) + '\n')
+    if delete_sources:
+        for _, p in pred_paths:
+            try:
+                if p and os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
 
 
 def main():
@@ -1208,26 +1253,31 @@ def main():
     agg_samples = 0
     agg_ipc: Dict[str, Dict[str, int]] = {}
     pred_parts: List[Tuple[str, str]] = []  # (source_name, pred_path)
+    # 统一预测输出
+    shared_pred_writer = None
+    global_index = 0
+    final_pred_path = args.save_predictions if args.save_predictions else None
+    if final_pred_path:
+        if world_size > 1:
+            # 分布式：每 rank 写临时文件，稍后 rank0 合并
+            d = os.path.dirname(final_pred_path)
+            n, ext = os.path.splitext(os.path.basename(final_pred_path))
+            pred_out_path_for_rank = os.path.join(d, f"{n}__rank{rank}{ext}")
+        else:
+            # 单进程：开启一个共享 writer
+            os.makedirs(os.path.dirname(final_pred_path) or '.', exist_ok=True)
+            shared_pred_writer = open(final_pred_path, 'w', encoding='utf-8')
+            pred_out_path_for_rank = final_pred_path
+    else:
+        pred_out_path_for_rank = None
 
     for i_path in inputs_rank:
         print(f"\n=== 处理输入: {i_path} ===")
         stem = os.path.splitext(os.path.basename(i_path))[0]
-        # 为多文件场景派生输出路径
-        # 分布式时为避免冲突，追加 rank 后缀
-        rank_suffix = (f"rank{rank}") if world_size > 1 else None
-        if multi or world_size > 1:
-            metrics_path = _with_stem_suffix(args.metrics_output, stem)
-            pred_path = _with_stem_suffix(args.save_predictions, stem)
-            ipc_text_path = _with_stem_suffix(args.ipc_summary_text, stem) if args.ipc_summary_text else None
-            if rank_suffix:
-                metrics_path = _with_stem_suffix(metrics_path, rank_suffix)
-                pred_path = _with_stem_suffix(pred_path, rank_suffix)
-                if ipc_text_path:
-                    ipc_text_path = _with_stem_suffix(ipc_text_path, rank_suffix)
-        else:
-            metrics_path = args.metrics_output
-            pred_path = args.save_predictions
-            ipc_text_path = args.ipc_summary_text
+        # 仅统一输出：不再生成每文件的 metrics/ipc 文本
+        metrics_path = None
+        pred_path = pred_out_path_for_rank
+        ipc_text_path = None
 
         # 选择评估路径
         if i_path.lower().endswith('.csv'):
@@ -1255,6 +1305,9 @@ def main():
                     shard_within_file=(world_size > 1 and len(inputs) < world_size),
                     rank=rank,
                     world_size=world_size,
+                    shared_writer=shared_pred_writer,
+                    source_name=stem,
+                    index_offset=global_index,
                 )
             else:
                 if pp_load_config is None or pp_process_csv_file is None or pp_normalize_single_ipc is None:
@@ -1302,6 +1355,9 @@ def main():
                     in_memory_labels=labels_mem,
                     ipc_key=args.ipc_key,
                     in_memory_ipcs=ipcs_mem,
+                    shared_writer=shared_pred_writer,
+                    source_name=stem,
+                    index_offset=global_index,
                 )
         else:
             # JSON/JSONL
@@ -1320,6 +1376,9 @@ def main():
                     shard_within_file=(world_size > 1 and len(inputs) < world_size),
                     rank=rank,
                     world_size=world_size,
+                    shared_writer=shared_pred_writer,
+                    source_name=stem,
+                    index_offset=global_index,
                 )
             else:
                 res = evaluate(
@@ -1333,16 +1392,12 @@ def main():
                     label_key=args.label_key,
                     save_predictions=pred_path,
                     ipc_key=args.ipc_key,
+                    shared_writer=shared_pred_writer,
+                    source_name=stem,
+                    index_offset=global_index,
                 )
 
-        # 写出该文件的汇总与指标
-        _write_ipc_and_metrics(
-            res,
-            ipc_top_k=args.ipc_top_k,
-            ipc_min_total=args.ipc_min_total,
-            ipc_summary_text_path=ipc_text_path,
-            metrics_output_path=metrics_path,
-        )
+        # 不进行逐文件指标写出
 
         # 累积到聚合
         cm = res.get('confusion_matrix') or {}
@@ -1368,18 +1423,18 @@ def main():
 
         file_results.append({
             'input': i_path,
-            'metrics_output': metrics_path,
-            'predictions_output': pred_path,
-            'ipc_summary_text': ipc_text_path,
             'samples': int(res.get('samples', 0)),
             'metrics': res.get('metrics'),
         })
-        if pred_path:
-            pred_parts.append((stem, pred_path))
+        try:
+            global_index += int(res.get('predictions_written', res.get('samples', 0)))
+        except Exception:
+            global_index += int(res.get('samples', 0))
+        if world_size > 1 and pred_out_path_for_rank:
+            pred_parts.append((stem, pred_out_path_for_rank))
 
-    # 多文件聚合输出
-    # 每进程写出自身聚合；多进程时，rank0 负责合并所有 rank 的聚合产物到最终文件
-    if multi:
+    # 仅输出一次聚合指标
+    if True:
         acc = (agg_tp + agg_tn) / max(1, (agg_tp+agg_tn+agg_fp+agg_fn))
         prec = agg_tp / max(1, (agg_tp+agg_fp))
         rec = agg_tp / max(1, (agg_tp+agg_fn))
@@ -1393,6 +1448,7 @@ def main():
             'input': inputs,
             'already_tokenized': bool(args.already_tokenized),
             'max_length': int(args.max_length),
+            'threshold': float(args.threshold),
         }
         # 聚合 IPC
         ipc_stats_all: List[Dict[str, Any]] = []
@@ -1416,114 +1472,57 @@ def main():
         res_all['ipc_stats'] = ipc_stats_all
         res_all['files'] = file_results
 
-        # 写出聚合 metrics 与 IPC 文本 (使用未加后缀的路径)
-        # 每个进程写出自身聚合（如分布式则带 rank 后缀）
-        metrics_path_final = args.metrics_output
-        ipc_text_path_final = args.ipc_summary_text
-        if world_size > 1:
-            metrics_path_final = _with_stem_suffix(metrics_path_final, f"rank{rank}")
-            if ipc_text_path_final:
-                ipc_text_path_final = _with_stem_suffix(ipc_text_path_final, f"rank{rank}")
-        _write_ipc_and_metrics(
-            res_all,
-            ipc_top_k=args.ipc_top_k,
-            ipc_min_total=args.ipc_min_total,
-            ipc_summary_text_path=ipc_text_path_final,
-            metrics_output_path=metrics_path_final,
-        )
+        if world_size == 1:
+            _write_ipc_and_metrics(
+                res_all,
+                ipc_top_k=args.ipc_top_k,
+                ipc_min_total=args.ipc_min_total,
+                ipc_summary_text_path=args.ipc_summary_text,
+                metrics_output_path=args.metrics_output,
+            )
 
-        # 合并预测到一个文件（每进程先写自身 stem 合并；rank0 之后再合并所有 rank 的）
-        if args.save_predictions:
-            _merge_prediction_files(pred_parts, args.save_predictions if world_size == 1 else _with_stem_suffix(args.save_predictions, f"rank{rank}"))
-
-    # 分布式最终合并：仅 rank0 合并所有 rank 的聚合文件到最终目标
+    # 分布式最终合并：仅 rank0 写最终指标，并合并各 rank 的预测到一个文件
     if world_size > 1:
         try:
             dist.barrier()
         except Exception:
             pass
         if rank == 0:
-            # metrics 聚合
-            rank_metric_files = []
-            if multi:
-                # 多文件聚合场景：各 rank 写出了 metrics_output__rankX.json
-                base = args.metrics_output
-                d = os.path.dirname(base)
-                n, ext = os.path.splitext(os.path.basename(base))
-                for r in range(world_size):
-                    path = os.path.join(d, f"{n}__rank{r}{ext}")
-                    if os.path.exists(path):
-                        rank_metric_files.append(path)
-            # 也尝试搜集每文件/每rank metrics（可选）
-            # 汇总 rank 级 metrics
-            if rank_metric_files:
-                # 简单式：读取并合并 cm 与 ipc_stats
-                agg_tn2=agg_fp2=agg_fn2=agg_tp2=0
-                agg_samples2=0
-                agg_ipc2: Dict[str, Dict[str,int]] = {}
-                for p in rank_metric_files:
-                    try:
-                        with open(p, 'r', encoding='utf-8') as f:
-                            obj = json.load(f)
-                        cm = obj.get('confusion_matrix') or {}
-                        agg_tn2 += int(cm.get('tn',0))
-                        agg_fp2 += int(cm.get('fp',0))
-                        agg_fn2 += int(cm.get('fn',0))
-                        agg_tp2 += int(cm.get('tp',0))
-                        agg_samples2 += int(obj.get('samples',0))
-                        for row in (obj.get('ipc_stats') or []):
-                            k = row.get('ipc','')
-                            a = agg_ipc2.get(k)
-                            if a is None:
-                                a = {'total':0,'label_pos':0,'pred_pos':0,'correct':0,'tp_pos':0}
-                                agg_ipc2[k] = a
-                            a['total'] += int(row.get('total',0))
-                            a['label_pos'] += int(row.get('label_pos',0))
-                            a['pred_pos'] += int(row.get('pred_pos',0))
-                            a['correct'] += int(row.get('correct',0))
-                            a['tp_pos'] += int(row.get('tp_pos',0))
-                    except Exception:
-                        continue
-                acc2 = (agg_tp2 + agg_tn2) / max(1, (agg_tp2+agg_tn2+agg_fp2+agg_fn2))
-                prec2 = agg_tp2 / max(1, (agg_tp2+agg_fp2))
-                rec2 = agg_tp2 / max(1, (agg_tp2+agg_fn2))
-                f12 = (2*prec2*rec2)/(prec2+rec2) if (prec2+rec2)>0 else 0.0
-                res_all2 = {
-                    'metrics': EvalResult(acc2, prec2, rec2, f12, agg_tp2, agg_tn2, agg_fp2, agg_fn2, agg_samples2).to_dict(),
-                    'confusion_matrix': {'tn': int(agg_tn2), 'fp': int(agg_fp2), 'fn': int(agg_fn2), 'tp': int(agg_tp2)},
+            pass
+        # 先进行全局指标求和
+        try:
+            dev = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+            t = torch.tensor([agg_tn, agg_fp, agg_fn, agg_tp, agg_samples], dtype=torch.long, device=dev)
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+            g_tn, g_fp, g_fn, g_tp, g_samples = [int(x) for x in t.tolist()]
+        except Exception:
+            # 回退：使用本地（不准确）
+            g_tn, g_fp, g_fn, g_tp, g_samples = agg_tn, agg_fp, agg_fn, agg_tp, agg_samples
+        if rank == 0:
+            # 计算全局指标并写出
+            accG = (g_tp + g_tn) / max(1, (g_tp+g_tn+g_fp+g_fn))
+            precG = g_tp / max(1, (g_tp+g_fp))
+            recG = g_tp / max(1, (g_tp+g_fn))
+            f1G = (2*precG*recG)/(precG+recG) if (precG+recG)>0 else 0.0
+            _write_ipc_and_metrics(
+                {
+                    'metrics': EvalResult(accG, precG, recG, f1G, g_tp, g_tn, g_fp, g_fn, g_samples).to_dict(),
+                    'confusion_matrix': {'tn': int(g_tn), 'fp': int(g_fp), 'fn': int(g_fn), 'tp': int(g_tp)},
                     'classification_report': f'Aggregated over {world_size} ranks',
-                    'samples': int(agg_samples2),
+                    'samples': int(g_samples),
                     'model': str(args.model),
                     'input': inputs,
                     'already_tokenized': bool(args.already_tokenized),
                     'max_length': int(args.max_length),
-                }
-                ipc_stats_all2: List[Dict[str, Any]] = []
-                for k, a in agg_ipc2.items():
-                    total_k = a['total']
-                    prec_k = a['tp_pos']/a['pred_pos'] if a['pred_pos'] else 0.0
-                    rec_k = a['tp_pos']/a['label_pos'] if a['label_pos'] else 0.0
-                    f1_k = (2*prec_k*rec_k/(prec_k+rec_k)) if (prec_k+rec_k)>0 else 0.0
-                    ipc_stats_all2.append({
-                        'ipc': k,
-                        'total': total_k,
-                        'accuracy': a['correct']/total_k if total_k else 0.0,
-                        'label_pos': a['label_pos'],
-                        'pred_pos': a['pred_pos'],
-                        'tp_pos': a['tp_pos'],
-                        'precision_pos': prec_k,
-                        'recall_pos': rec_k,
-                        'f1_pos': f1_k,
-                    })
-                ipc_stats_all2.sort(key=lambda x: x['total'], reverse=True)
-                res_all2['ipc_stats'] = ipc_stats_all2
-                _write_ipc_and_metrics(
-                    res_all2,
-                    ipc_top_k=args.ipc_top_k,
-                    ipc_min_total=args.ipc_min_total,
-                    ipc_summary_text_path=args.ipc_summary_text,
-                    metrics_output_path=args.metrics_output,
-                )
+                    'threshold': float(args.threshold),
+                    # 为避免对象通信，分布式下省略 IPC 细分（可通过读取合并后的预测文件再生成）
+                    'ipc_stats': [],
+                },
+                ipc_top_k=args.ipc_top_k,
+                ipc_min_total=args.ipc_min_total,
+                ipc_summary_text_path=args.ipc_summary_text,
+                metrics_output_path=args.metrics_output,
+            )
 
             # 合并各 rank 的预测
             if args.save_predictions:
@@ -1536,7 +1535,20 @@ def main():
                     if os.path.exists(p):
                         parts.append((f"rank{r}", p))
                 if parts:
-                    _merge_prediction_files(parts, base)
+                    _merge_prediction_files(parts, base, delete_sources=True)
+        # 关闭共享 writer（分布式不使用，共享则在非分布式下）
+        if shared_pred_writer is not None:
+            try:
+                shared_pred_writer.close()
+            except Exception:
+                pass
+    else:
+        # 非分布式：关闭共享 writer
+        if shared_pred_writer is not None:
+            try:
+                shared_pred_writer.close()
+            except Exception:
+                pass
 
 
 if __name__ == '__main__':
