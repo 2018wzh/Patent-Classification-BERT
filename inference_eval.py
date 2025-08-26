@@ -1214,14 +1214,12 @@ def main():
     parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--max-length', type=int, default=512)
     parser.add_argument('--threshold', type=float, default=0.5, help='正类判定阈值，prob(1) > threshold 判为 1')
-    parser.add_argument('--save-predictions', default="outputs/prediction.jsonl", help='保存逐样本预测 jsonl')
-    parser.add_argument('--metrics-output', default="outputs/metrics.json", help='保存指标 json')
     parser.add_argument('--gpus', default=None, help='指定可见 GPU (如 "0" 或 "0,1")')
     parser.add_argument('--config', default='config/config.json', help='当输入为 CSV 时加载的配置文件 (含 preprocess_config.valid_labels/remove_keywords)')
     parser.add_argument('--ipc-key', default='ipc', help='IPC 字段名称 (用于统计)')
     parser.add_argument('--ipc-top-k', type=int, default=10, help='IPC 汇总中前K名 (比例/数量)')
     parser.add_argument('--ipc-min-total', type=int, default=1, help='计算最高占比/前K占比列表时的最小样本数过滤 (默认不过滤)')
-    parser.add_argument('--ipc-summary-text', default="outputs/ipc_summary.txt", help='将 IPC 汇总指标写出为纯文本文件')
+    parser.add_argument('--output-dir', default='outputs/metrics', help='将结果统一输出到该目录 (会生成 predictions.jsonl / metrics.json / ipc_summary.txt)')
     args = parser.parse_args()
 
     if args.gpus:
@@ -1232,6 +1230,15 @@ def main():
     is_dist, rank, world_size, local_rank = _maybe_init_dist()
     if is_dist:
         print(f"[分布式] world_size={world_size} rank={rank} local_rank={local_rank}")
+
+    # 统一输出目录（必填）
+    out_dir = os.path.abspath(args.output_dir)
+    os.makedirs(out_dir, exist_ok=True)
+    # 为复用后续逻辑，直接在 args 上挂载统一的输出路径
+    args.save_predictions = os.path.join(out_dir, 'predictions.jsonl')
+    args.metrics_output = os.path.join(out_dir, 'metrics.json')
+    args.ipc_summary_text = os.path.join(out_dir, 'ipc_summary.txt')
+    print(f"[输出] 统一输出目录: {out_dir}")
 
     # 扩展输入 (通配符)
     inputs = _expand_inputs(args.input)
