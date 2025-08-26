@@ -255,6 +255,16 @@ def _total_from_metadata(input_path: str) -> Optional[int]:
                 v = counts.get('total_records')
                 if isinstance(v, (int, float)):
                     return int(v)
+        # 进一步回退：若是 data_origin.jsonl 且与 metadata 同目录，则直接返回 total_records
+        base = os.path.basename(input_path).lower()
+        if base.startswith('data_origin') or base == 'origin.jsonl':
+            v = (meta.get('counts') or {}).get('total_records')
+            if isinstance(v, (int, float)) and v:
+                return int(v)
+        # 最后回退：同目录任意 jsonl，若 counts.total_records 存在，则作为估计值
+        v_any = (meta.get('counts') or {}).get('total_records')
+        if isinstance(v_any, (int, float)) and v_any:
+            return int(v_any)
     except Exception:
         return None
     return None

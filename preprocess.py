@@ -488,7 +488,6 @@ def main():
     # 输出目录与文件路径
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
-    raw_output_file_json = os.path.join(output_dir, "data_origin.json")
     raw_output_file_jsonl = os.path.join(output_dir, "data_origin.jsonl")
     tokenized_output_file = os.path.join(output_dir, "tokenized_data.jsonl")
 
@@ -679,12 +678,12 @@ def main():
             except Exception:
                 tokenized_max_len_observed = 0
 
-    # 输出 (非流式写法)
+    # 输出 (非流式写法) —— 仅生成 JSONL
     if not args.stream:
-        raw_output_file = raw_output_file_json
-        print(f"写出原始数据 (全部记录): {raw_output_file}")
-        with open(raw_output_file, "w", encoding="utf-8") as f:
-            json.dump(all_records, f, ensure_ascii=False, indent=2)
+        print(f"写出原始数据(JSONL): {raw_output_file_jsonl}")
+        with open(raw_output_file_jsonl, "w", encoding="utf-8") as f:
+            for rec in tqdm(all_records, desc="写出原始JSONL", unit="条"):
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
         if not args.skip_tokenize:
             print(f"写出分词数据: {tokenized_output_file}")
@@ -704,8 +703,8 @@ def main():
     else:
         if not args.skip_tokenize:
             print(f"分词样本数: {len(tokenized_data)}")
-            print(f"分词后数据输出: {tokenized_output_file}")
-        print(f"原始数据输出: {raw_output_file_json}")
+            print(f"分词后数据输出(JSONL): {tokenized_output_file}")
+        print(f"原始数据输出(JSONL): {raw_output_file_jsonl}")
 
     # 写出元数据，供后续 split/pack 复用，跳过扫描
     meta = {
@@ -713,7 +712,7 @@ def main():
         "stream": bool(args.stream),
         "output_dir": output_dir,
         "paths": {
-            "origin_json": raw_output_file_json,
+            "origin_json": None,
             "origin_jsonl": raw_output_file_jsonl,
             "tokenized_jsonl": tokenized_output_file if not args.skip_tokenize else None,
         },
