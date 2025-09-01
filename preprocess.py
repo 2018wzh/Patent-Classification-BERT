@@ -448,20 +448,13 @@ def main():
     print(f"通配符展开后文件总数: {len(expanded_list)}")
 
     # 逐个文件处理 (使用展开后的列表)
-    stream_counts: Dict[str, int] = {}
     for i, csv_path in enumerate(expanded_list, 1):
         print(f"\n--- 处理第 {i}/{len(expanded_list)} 个文件 ---")
         print(f"文件路径: {csv_path}")
         try:
             if args.stream:
-                # 流式不汇总到内存，先累计计数用于反馈
-                cnt = 0
-                for _ in process_csv_file_stream(csv_path, remove_keywords):
-                    cnt += 1
-                print(f"流式预扫描完成，约 {cnt} 条记录")
-                stream_counts[csv_path] = cnt
-                # 二次读取时再真正处理（直接在后续流式阶段完成），这里只记录总数占位
-                all_records.extend([])
+                # 流式模式下不进行预扫描与计数，后续阶段单次遍历时边扫描边统计
+                pass
             else:
                 records = process_csv_file(csv_path, remove_keywords)
                 print(f"成功处理 {len(records)} 条记录")
@@ -498,9 +491,6 @@ def main():
     if args.stream:
         # 以 JSONL 形式写原始与分词结果（生产者-消费者异步写入）
         print("[流式] 输出到 JSONL: data_origin.jsonl / tokenized_data.jsonl")
-        overall_total = sum(stream_counts.values()) if stream_counts else 0
-        if overall_total:
-            print(f"[流式] 预估总行数: {overall_total}")
         # 写线程与队列
         raw_q: Queue = Queue(maxsize=10000)
         tok_q: Queue = Queue(maxsize=10000)
@@ -568,12 +558,12 @@ def main():
 
         pbar = None
         try:
-            # 第二轮实际流处理
-            pbar = tqdm(total=overall_total if overall_total > 0 else None, desc="流式处理", unit="行")
+            # 流式实际处理：单次遍历，边扫描边统计
+            pbar = tqdm(total=None, desc="流式处理", unit="行")
             for csv_path in expanded_list:
                 for r in process_csv_file_stream(csv_path, preprocess_cfg.get('remove_keywords')):
                     total_count += 1
-                    if pbar:
+                    if pbar is not None:
                         pbar.update(1)
                     ipc_code = normalize_single_ipc(r.get("ipc", ""))
                     matched_prefix = ""
@@ -633,7 +623,7 @@ def main():
             raw_thr.join(); tok_thr.join()
             if ex is not None:
                 ex.shutdown(wait=True, cancel_futures=False)
-            if pbar:
+            if pbar is not None:
                 try:
                     pbar.close()
                 except Exception:
