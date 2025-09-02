@@ -830,14 +830,6 @@ def evaluate_stream_csv(
                 writer.close()
             except Exception:
                 pass
-        try:
-            del model
-        except Exception:
-            pass
-        try:
-            del tokenizer
-        except Exception:
-            pass
         _cuda_cleanup()
 
     if local_opened and writer is not None:
@@ -1007,14 +999,6 @@ def evaluate(model_dir: str,
             if torch.cuda.is_available() and empty_cache_interval > 0 and ((end // max(1, batch_size)) % empty_cache_interval == 0):
                 torch.cuda.empty_cache()
     finally:
-        try:
-            del model
-        except Exception:
-            pass
-        try:
-            del tokenizer
-        except Exception:
-            pass
         _cuda_cleanup()
 
     # Metrics
