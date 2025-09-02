@@ -4,6 +4,7 @@ import json
 import argparse
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
+from contextlib import nullcontext
 
 import torch
 import torch.distributed as dist
@@ -233,6 +234,22 @@ def _cuda_cleanup():
         pass
 
 
+def _autocast_ctx(device: torch.device, precision: str):
+    """返回自动混合精度上下文。precision: 'fp32'|'fp16'|'bf16'|'auto'。CPU 下返回空上下文。"""
+    try:
+        if device.type != 'cuda':
+            return nullcontext()
+        if precision not in ('fp16', 'bf16', 'auto'):
+            return nullcontext()
+        import torch.cuda.amp as amp  # 延迟导入
+        if precision == 'bf16':
+            return amp.autocast(dtype=torch.bfloat16)
+        # auto 或 fp16 走 fp16 默认
+        return amp.autocast(dtype=torch.float16)
+    except Exception:
+        return nullcontext()
+
+
 def _total_from_metadata(input_path: str) -> Optional[int]:
     """尝试从同目录 metadata.json 获取该输入对应的样本总数，用于进度条 total。"""
     try:
@@ -293,6 +310,8 @@ def evaluate_stream(
     shared_writer: Optional[Any] = None,
     source_name: Optional[str] = None,
     index_offset: int = 0,
+    amp_precision: str = 'auto',
+    empty_cache_interval: int = 200,
 ) -> Dict[str, Any]:
     """流式评估：一边读取一边(可选分词)一边推理，并增量写出预测与累计指标。仅支持 .jsonl。"""
     if not input.lower().endswith('.jsonl'):
@@ -405,9 +424,10 @@ def evaluate_stream(
                     else:
                         enc = tokenizer(buf_texts, truncation=True, max_length=max_length, padding=True, return_tensors='pt')
                         inputs = {k: v.to(device) for k,v in enc.items()}
-                    with torch.no_grad():
-                        logits = model(**inputs).logits
-                        probs = torch.softmax(logits, dim=-1)
+                    with torch.inference_mode():
+                        with _autocast_ctx(device, amp_precision):
+                            logits = model(**inputs).logits
+                            probs = torch.softmax(logits, dim=-1)
                     # 阈值判定
                     prob1_b = probs[:,1].detach().cpu().tolist()
                     preds_b = [1 if p > threshold else 0 for p in prob1_b]
@@ -425,6 +445,7 @@ def evaluate_stream(
                     n_total += len(preds_b)
                     update_ipc(buf_ipc, buf_labels, preds_b)
                     if writer is not None:
+                        lines = []
                         for j, pred in enumerate(preds_b):
                             rec = {
                                 'index': index_offset + idx + j,
@@ -440,12 +461,13 @@ def evaluate_stream(
                                 rec['source'] = source_name
                             if len(buf_rec_ids) > j and buf_rec_ids[j] is not None:
                                 rec['id'] = buf_rec_ids[j]
-                            writer.write(json.dumps(rec, ensure_ascii=False) + '\n')
+                            lines.append(json.dumps(rec, ensure_ascii=False) + '\n')
+                        writer.write(''.join(lines))
                     idx += len(preds_b)
                     # 清空批
                     buf_ids.clear(); buf_attn.clear(); buf_texts.clear(); buf_labels.clear(); buf_ipc.clear(); buf_rec_ids.clear()
                     batch_counter += 1
-                    if torch.cuda.is_available() and (batch_counter % 50 == 0):
+                    if torch.cuda.is_available() and empty_cache_interval > 0 and (batch_counter % empty_cache_interval == 0):
                         # 周期性释放缓存显存，避免峰值堆积
                         torch.cuda.empty_cache()
 
@@ -464,9 +486,10 @@ def evaluate_stream(
                 else:
                     enc = tokenizer(buf_texts, truncation=True, max_length=max_length, padding=True, return_tensors='pt')
                     inputs = {k: v.to(device) for k,v in enc.items()}
-                with torch.no_grad():
-                    logits = model(**inputs).logits
-                    probs = torch.softmax(logits, dim=-1)
+                with torch.inference_mode():
+                    with _autocast_ctx(device, amp_precision):
+                        logits = model(**inputs).logits
+                        probs = torch.softmax(logits, dim=-1)
                 prob1_b = probs[:,1].detach().cpu().tolist()
                 preds_b = [1 if p > threshold else 0 for p in prob1_b]
                 for j, pred in enumerate(preds_b):
@@ -482,6 +505,7 @@ def evaluate_stream(
                 n_total += len(preds_b)
                 update_ipc(buf_ipc, buf_labels, preds_b)
                 if writer is not None:
+                    lines = []
                     for j, pred in enumerate(preds_b):
                         rec = {
                             'index': index_offset + idx + j,
@@ -497,8 +521,9 @@ def evaluate_stream(
                             rec['source'] = source_name
                         if len(buf_rec_ids) > j and buf_rec_ids[j] is not None:
                             rec['id'] = buf_rec_ids[j]
-                        writer.write(json.dumps(rec, ensure_ascii=False) + '\n')
-                if torch.cuda.is_available():
+                        lines.append(json.dumps(rec, ensure_ascii=False) + '\n')
+                    writer.write(''.join(lines))
+                if torch.cuda.is_available() and empty_cache_interval > 0:
                     torch.cuda.empty_cache()
                 # 无需清空，循环结束
     finally:
@@ -583,6 +608,8 @@ def evaluate_stream_csv(
     shared_writer: Optional[Any] = None,
     source_name: Optional[str] = None,
     index_offset: int = 0,
+    amp_precision: str = 'auto',
+    empty_cache_interval: int = 200,
 ) -> Dict[str, Any]:
     """CSV 流式评估：逐行读取 CSV -> 统一结构 -> IPC 前缀匹配打标 -> 批量分词 -> 推理 -> 增量写出/累计指标。"""
     if pp_process_csv_file_stream is None or pp_normalize_single_ipc is None:
@@ -661,9 +688,10 @@ def evaluate_stream_csv(
             if len(buf_labels) >= batch_size:
                 enc = tokenizer(buf_texts, truncation=True, max_length=max_length, padding=True, return_tensors='pt')
                 inputs = {k: v.to(device) for k,v in enc.items()}
-                with torch.no_grad():
-                    logits = model(**inputs).logits
-                    probs = torch.softmax(logits, dim=-1)
+                with torch.inference_mode():
+                    with _autocast_ctx(device, amp_precision):
+                        logits = model(**inputs).logits
+                        probs = torch.softmax(logits, dim=-1)
                 prob1_b = probs[:,1].detach().cpu().tolist()
                 preds_b = [1 if p > threshold else 0 for p in prob1_b]
                 for j, pred in enumerate(preds_b):
@@ -693,16 +721,17 @@ def evaluate_stream_csv(
                         writer.write(json.dumps(rec_out, ensure_ascii=False) + '\n')
                 idx += len(preds_b)
                 buf_texts.clear(); buf_labels.clear(); buf_ipc.clear()
-                if torch.cuda.is_available() and (idx // max(1, batch_size)) % 50 == 0:
+                if torch.cuda.is_available() and empty_cache_interval > 0 and (idx // max(1, batch_size)) % empty_cache_interval == 0:
                     torch.cuda.empty_cache()
 
         # 尾批
         if buf_labels:
             enc = tokenizer(buf_texts, truncation=True, max_length=max_length, padding=True, return_tensors='pt')
             inputs = {k: v.to(device) for k,v in enc.items()}
-            with torch.no_grad():
-                logits = model(**inputs).logits
-                probs = torch.softmax(logits, dim=-1)
+            with torch.inference_mode():
+                with _autocast_ctx(device, amp_precision):
+                    logits = model(**inputs).logits
+                    probs = torch.softmax(logits, dim=-1)
             prob1_b = probs[:,1].detach().cpu().tolist()
             preds_b = [1 if p > threshold else 0 for p in prob1_b]
             for j, pred in enumerate(preds_b):
@@ -815,6 +844,8 @@ def evaluate(model_dir: str,
              shared_writer: Optional[Any] = None,
              source_name: Optional[str] = None,
              index_offset: int = 0,
+             amp_precision: str = 'auto',
+             empty_cache_interval: int = 200,
              ) -> Dict[str, Any]:
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     tokenizer = BertTokenizer.from_pretrained(model_dir, use_fast=True)
@@ -884,14 +915,15 @@ def evaluate(model_dir: str,
                 batch_texts = texts[start:end]  # type: ignore
                 enc = tokenizer(batch_texts, truncation=True, max_length=max_length, padding=True, return_tensors='pt')
                 inputs = {k: v.to(device) for k, v in enc.items()}
-            with torch.no_grad():
-                logits = model(**inputs).logits
-                probs = torch.softmax(logits, dim=-1)
+            with torch.inference_mode():
+                with _autocast_ctx(device, amp_precision):
+                    logits = model(**inputs).logits
+                    probs = torch.softmax(logits, dim=-1)
             p1 = probs[:, 1].detach().cpu()
             pred_b = (p1 > threshold).to(torch.int64).tolist()
             preds.extend(pred_b)
             prob_1.extend(p1.tolist())
-            if torch.cuda.is_available() and ((end // max(1, batch_size)) % 50 == 0):
+            if torch.cuda.is_available() and empty_cache_interval > 0 and ((end // max(1, batch_size)) % empty_cache_interval == 0):
                 torch.cuda.empty_cache()
     finally:
         try:
@@ -1301,6 +1333,8 @@ def main():
     parser.add_argument('--ipc-top-k', type=int, default=10, help='IPC 汇总中前K名 (比例/数量)')
     parser.add_argument('--ipc-min-total', type=int, default=1, help='计算最高占比/前K占比列表时的最小样本数过滤 (默认不过滤)')
     parser.add_argument('--output-dir', default='outputs/metrics', help='将结果统一输出到该目录 (会生成 predictions.jsonl / metrics.json / ipc_summary.txt)')
+    parser.add_argument('--precision', default='auto', choices=['auto','fp32','fp16','bf16'], help='推理精度：auto 会在 CUDA 上使用混合精度')
+    parser.add_argument('--empty-cache-interval', type=int, default=200, help='每多少个批次/步清一次 CUDA 缓存；<=0 表示不清理')
     args = parser.parse_args()
 
     if args.gpus:
@@ -1396,6 +1430,8 @@ def main():
                     shared_writer=shared_pred_writer,
                     source_name=stem,
                     index_offset=global_index,
+                    amp_precision=args.precision,
+                    empty_cache_interval=args.empty_cache_interval,
                 )
             else:
                 if pp_load_config is None or pp_process_csv_file is None or pp_normalize_single_ipc is None:
@@ -1446,6 +1482,8 @@ def main():
                     shared_writer=shared_pred_writer,
                     source_name=stem,
                     index_offset=global_index,
+                    amp_precision=args.precision,
+                    empty_cache_interval=args.empty_cache_interval,
                 )
         else:
             # JSON/JSONL
@@ -1467,6 +1505,8 @@ def main():
                     shared_writer=shared_pred_writer,
                     source_name=stem,
                     index_offset=global_index,
+                    amp_precision=args.precision,
+                    empty_cache_interval=args.empty_cache_interval,
                 )
             else:
                 res = evaluate(
@@ -1483,6 +1523,8 @@ def main():
                     shared_writer=shared_pred_writer,
                     source_name=stem,
                     index_offset=global_index,
+                    amp_precision=args.precision,
+                    empty_cache_interval=args.empty_cache_interval,
                 )
 
         # 不进行逐文件指标写出
