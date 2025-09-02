@@ -163,6 +163,18 @@ def normalize_ipc_list(ipc: str) -> List[str]:
     return normed
 
 
+def _normalize_row_keys(row: Dict[str, Any]) -> Dict[str, Any]:
+    """去除CSV行中键名的 BOM(\ufeff) 与首尾空白，避免首列丢失。"""
+    out: Dict[str, Any] = {}
+    for k, v in row.items():
+        if isinstance(k, str):
+            nk = k.lstrip("\ufeff").strip()
+        else:
+            nk = k
+        out[nk] = v
+    return out
+
+
 def _writer_worker(path: str, q: Queue):
     """后台写线程：从队列读取已带换行的字符串并写入文件，遇到 None 结束。"""
     # 使用缓冲写入，线程结束时自动关闭
@@ -249,7 +261,7 @@ def process_csv_file(
     all_rows = []
     with open(path, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        all_rows = list(reader)
+        all_rows = [_normalize_row_keys(r) for r in reader]
 
     print(f"文件已读入内存，共 {len(all_rows)} 行数据")
 
@@ -270,9 +282,57 @@ def process_csv_file_stream(
         reader = csv.DictReader(f)
         for row in reader:
             try:
+                row = _normalize_row_keys(row)
                 yield unify_record(row, remove_keywords)
             except Exception:
                 continue
+
+
+    
+
+
+def write_cleaned_csv_one(
+    in_path: str,
+    out_path: str,
+    selected_columns: List[str],
+    remove_keywords: Optional[List[str]] = None,
+):
+    """对单个 CSV 进行清洗并输出到 out_path。返回统计信息。"""
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    total_read = 0
+    total_written = 0
+    desc = f"清洗: {os.path.basename(in_path)}"
+    pbar = tqdm(total=None, desc=desc, unit="行")
+    with open(out_path, "w", encoding="utf-8-sig", newline="") as f_out:
+        writer = csv.writer(f_out)
+        writer.writerow(selected_columns)
+        try:
+            with open(in_path, "r", encoding="utf-8") as f_in:
+                reader = csv.DictReader(f_in)
+                for row in reader:
+                    row = _normalize_row_keys(row)
+                    total_read += 1
+                    out_row: List[str] = []
+                    for col in selected_columns:
+                        val = row.get(col, "")
+                        if isinstance(val, str):
+                            val = clean_text_content(val, remove_keywords or [])
+                        else:
+                            val = "" if val is None else str(val)
+                        out_row.append(val)
+                    writer.writerow(out_row)
+                    if pbar is not None:
+                        pbar.update(1)
+                    total_written += 1
+        except Exception as e:
+            print(f"警告: 清洗CSV处理失败 {in_path}: {e}")
+        finally:
+            if pbar is not None:
+                try:
+                    pbar.close()
+                except Exception:
+                    pass
+    return {"read": total_read, "written": total_written}
 
 
 def main():
@@ -321,6 +381,22 @@ def main():
         "--label-column-name", help="覆盖 train_config.label_column_name (默认 label)"
     )
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--clean-columns",
+        action="append",
+        help="清洗后CSV需保留的原始列(可多次或用逗号分隔)；也可在配置 preprocess_config.clean_columns 指定",
+    )
+    # 聚合导出已废弃，改为仅逐文件输出
+    parser.add_argument(
+        "--clean-output-suffix",
+        default="_cleaned.csv",
+        help="逐文件清洗输出的文件名后缀，默认 _cleaned.csv",
+    )
+    parser.add_argument(
+        "--clean-csv",
+        action="store_true",
+        help="仅执行CSV清洗并输出逐文件结果，不进行 JSONL/匹配/分词 等其他流程",
+    )
     args = parser.parse_args()
 
     config_path = args.config
@@ -374,6 +450,24 @@ def main():
         print(f"数据清洗关键字数: {len(remove_keywords)}")
     else:
         print("未配置数据清洗关键字")
+
+    # 解析清洗CSV的保留列
+    clean_columns_cfg = preprocess_cfg.get("clean_columns") or []
+    clean_columns: List[str] = list(clean_columns_cfg)
+    if args.clean_columns:
+        merged: List[str] = []
+        for item in args.clean_columns:
+            parts = [p.strip() for p in item.split(",") if p and p.strip()]
+            merged.extend(parts)
+        # 去重但保持顺序
+        seen_c: Set[str] = set()
+        clean_columns = []
+        for c in merged:
+            if c not in seen_c:
+                seen_c.add(c)
+                clean_columns.append(c)
+    # 将最终列写回配置对象，便于输出到 metadata
+    preprocess_cfg["clean_columns"] = clean_columns
 
     all_records: List[Dict[str, Any]] = []
     print(f"共需处理 {len(convert_files)} 个文件")
@@ -447,6 +541,22 @@ def main():
 
     print(f"通配符展开后文件总数: {len(expanded_list)}")
 
+    # clean-csv 模式：仅逐文件清洗并退出
+    if args.clean_csv:
+        if not clean_columns:
+            print("错误: clean-csv 模式需要指定 --clean-columns 或在配置 preprocess_config.clean_columns 中配置列名")
+            sys.exit(2)
+        os.makedirs(args.output_dir, exist_ok=True)
+        cleaned_csv_files: List[str] = []
+        for src in expanded_list:
+            base = os.path.splitext(os.path.basename(src))[0]
+            out_clean = os.path.join(args.output_dir, f"{base}{args.clean_output_suffix}")
+            stats_csv = write_cleaned_csv_one(src, out_clean, clean_columns, remove_keywords)
+            cleaned_csv_files.append(out_clean)
+            print(f"清洗CSV完成: {os.path.basename(src)} -> {out_clean}  读取 {stats_csv['read']} 行，写出 {stats_csv['written']} 行")
+        print("[完成] 数据清洗导出")
+        return
+
     # 逐个文件处理 (使用展开后的列表)
     for i, csv_path in enumerate(expanded_list, 1):
         print(f"\n--- 处理第 {i}/{len(expanded_list)} 个文件 ---")
@@ -483,6 +593,7 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     raw_output_file_jsonl = os.path.join(output_dir, "data_origin.jsonl")
     tokenized_output_file = os.path.join(output_dir, "tokenized_data.jsonl")
+    cleaned_csv_files: List[str] = []
 
     # 统计分词观测长度与数量
     tokenized_count_observed = 0
@@ -628,6 +739,16 @@ def main():
                     pbar.close()
                 except Exception:
                     pass
+        # 流式阶段结束后，如配置了保留列，进行逐文件清洗后CSV导出（二次遍历源文件）
+        if clean_columns:
+            multi = len(expanded_list) > 1
+            # 逐文件输出，使用 --clean-output-suffix
+            for src in expanded_list:
+                base = os.path.splitext(os.path.basename(src))[0]
+                out_clean = os.path.join(output_dir, f"{base}{args.clean_output_suffix}")
+                stats_csv = write_cleaned_csv_one(src, out_clean, clean_columns, remove_keywords)
+                cleaned_csv_files.append(out_clean)
+                print(f"清洗CSV完成: {os.path.basename(src)} -> {out_clean}  读取 {stats_csv['read']} 行，写出 {stats_csv['written']} 行")
     else:
         total_count = len(all_records)
         for r in tqdm(all_records, desc="匹配", unit="记录"):
@@ -695,6 +816,16 @@ def main():
             print(f"分词样本数: {len(tokenized_data)}")
             print(f"分词后数据输出(JSONL): {tokenized_output_file}")
         print(f"原始数据输出(JSONL): {raw_output_file_jsonl}")
+        # 非流式模式下，同样支持逐文件清洗后CSV导出（独立二次遍历）
+        if clean_columns:
+            multi = len(expanded_list) > 1
+            # 逐文件输出，使用 --clean-output-suffix
+            for src in expanded_list:
+                base = os.path.splitext(os.path.basename(src))[0]
+                out_clean = os.path.join(output_dir, f"{base}{args.clean_output_suffix}")
+                stats_csv = write_cleaned_csv_one(src, out_clean, clean_columns, remove_keywords)
+                cleaned_csv_files.append(out_clean)
+                print(f"清洗CSV完成: {os.path.basename(src)} -> {out_clean}  读取 {stats_csv['read']} 行，写出 {stats_csv['written']} 行")
 
     # 写出元数据，供后续 split/pack 复用，跳过扫描
     meta = {
@@ -705,6 +836,8 @@ def main():
             "origin_json": None,
             "origin_jsonl": raw_output_file_jsonl,
             "tokenized_jsonl": tokenized_output_file if not args.skip_tokenize else None,
+            # 不再写入单文件 cleaned_csv 聚合路径
+            "cleaned_csv_files": cleaned_csv_files if cleaned_csv_files else None,
         },
         "counts": {
             "total_records": int(total_count),
