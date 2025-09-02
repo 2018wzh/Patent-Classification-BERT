@@ -739,16 +739,6 @@ def main():
                     pbar.close()
                 except Exception:
                     pass
-        # 流式阶段结束后，如配置了保留列，进行逐文件清洗后CSV导出（二次遍历源文件）
-        if clean_columns:
-            multi = len(expanded_list) > 1
-            # 逐文件输出，使用 --clean-output-suffix
-            for src in expanded_list:
-                base = os.path.splitext(os.path.basename(src))[0]
-                out_clean = os.path.join(output_dir, f"{base}{args.clean_output_suffix}")
-                stats_csv = write_cleaned_csv_one(src, out_clean, clean_columns, remove_keywords)
-                cleaned_csv_files.append(out_clean)
-                print(f"清洗CSV完成: {os.path.basename(src)} -> {out_clean}  读取 {stats_csv['read']} 行，写出 {stats_csv['written']} 行")
     else:
         total_count = len(all_records)
         for r in tqdm(all_records, desc="匹配", unit="记录"):
